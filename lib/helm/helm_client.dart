@@ -136,6 +136,18 @@ class HelmClient {
     _send(tTouch, encodeTouch(ctx, x, y, down));
   }
 
+  /// Sends one two-finger `0x164c` pinch frame at explicit positions. Unlike
+  /// [zoom] (which plays out a whole synthetic pinch gesture over several
+  /// frames), this is for callers driving real, continuously-tracked
+  /// multi-touch input (e.g. two actual fingers on a touchscreen) where the
+  /// finger positions come from the platform's own pointer events rather
+  /// than from an interpolated animation.
+  void sendPinchFrame(double x0, double y0, double x1, double y1, bool down) {
+    final ctx = touchCtx;
+    if (ctx == null) throw const NoTouchContextException();
+    _send(tTouch, encodePinch(ctx, x0, y0, x1, y1, down));
+  }
+
   /// A press+release at normalized (x, y).
   Future<void> tap(double x, double y) async {
     touch(x, y, true);
