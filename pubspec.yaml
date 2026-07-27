@@ -35,6 +35,12 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # mDNS browsing for _garmin-helm._tcp.local plotter discovery.
+  multicast_dns: ^0.3.3
+
+  # HTTP client for the plotter's on-board bl-id pairing endpoint.
+  http: ^1.6.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
