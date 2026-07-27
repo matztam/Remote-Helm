@@ -41,6 +41,13 @@ dependencies:
   # HTTP client for the plotter's on-board bl-id pairing endpoint.
   http: ^1.6.0
 
+  # RTSP video playback (the official video_player plugin has no RTSP
+  # support; fvp registers an FFmpeg/mdk-based platform implementation for it
+  # that covers Windows, Linux, and Android, which the plotter's UDP-only
+  # RTSP/H.264 stream needs).
+  video_player: ^2.10.0
+  fvp: ^0.37.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
