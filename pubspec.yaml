@@ -48,6 +48,14 @@ dependencies:
   video_player: ^2.10.0
   fvp: ^0.37.3
 
+  # Desktop (Windows/Linux) window control: resizable windowed mode by
+  # default, with a fullscreen toggle. Android's fullscreen instead goes
+  # through Flutter's built-in SystemChrome (see ui/platform_layout.dart).
+  window_manager: ^0.5.2
+
+  # Persists the last-connected plotter host across app restarts.
+  shared_preferences: ^2.5.5
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
