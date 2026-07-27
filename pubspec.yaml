@@ -56,6 +56,13 @@ dependencies:
   # Persists the last-connected plotter host across app restarts.
   shared_preferences: ^2.5.5
 
+  # Android filters incoming multicast UDP packets unless a WifiManager
+  # MulticastLock is held; multicast_dns doesn't acquire one itself, so
+  # without this, mDNS discovery silently sees no replies on Android
+  # (a known multicast_dns limitation, flutter/flutter#155499). No-op on
+  # desktop platforms.
+  flutter_multicast_lock: ^1.2.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -10,6 +10,7 @@
 /// official `multicast_dns` package instead of hand-rolled DNS parsing.
 library;
 
+import 'package:flutter_multicast_lock/flutter_multicast_lock.dart';
 import 'package:multicast_dns/multicast_dns.dart';
 
 const String helmService = '_garmin-helm._tcp.local';
@@ -73,6 +74,13 @@ Future<List<HelmServiceInfo>> browse({
   List<String> serviceTypes = const [helmService],
   Duration timeout = const Duration(seconds: 4),
 }) async {
+  // Android drops incoming multicast UDP packets unless a WifiManager
+  // MulticastLock is held; multicast_dns doesn't acquire one itself, so
+  // without this the query goes out but replies are silently never
+  // delivered on Android (a no-op on other platforms).
+  final multicastLock = FlutterMulticastLock();
+  await multicastLock.acquireMulticastLock();
+
   final client = MDnsClient();
   await client.start();
   try {
@@ -140,6 +148,7 @@ Future<List<HelmServiceInfo>> browse({
     return found.values.toList();
   } finally {
     client.stop();
+    await multicastLock.releaseMulticastLock();
   }
 }
 

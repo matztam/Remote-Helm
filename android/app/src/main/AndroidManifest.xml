@@ -1,4 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- TCP session to the plotter (:51200) and its RTSP video stream (:554). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- mDNS discovery (multicast_dns) needs to see the Wi-Fi network state,
+         and Android filters multicast packets by default unless a
+         MulticastLock is held — CHANGE_WIFI_MULTICAST_STATE is required to
+         acquire one, or _garmin-helm._tcp.local browsing won't see replies. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <application
         android:label="remote_helm"
         android:name="${applicationName}"
