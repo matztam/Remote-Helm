@@ -2,16 +2,21 @@ name: Build
 run-name: Build (Linux/Windows/Android)
 
 # Runs on every push and can also be triggered manually from the Actions
-# tab. Builds all three supported platforms and uploads each as a
-# downloadable workflow artifact. Windows and Linux desktop builds can't be
-# cross-compiled from one host, so each platform gets its own
-# appropriately-hosted runner.
+# tab. Builds all three supported platforms. Windows and Linux desktop
+# builds can't be cross-compiled from one host, so each platform gets its
+# own appropriately-hosted runner.
+#
+# Ordinary pushes upload each platform's raw build as a downloadable
+# workflow artifact (`remote_helm-<platform>`) — handy for grabbing the
+# latest master build without waiting for a tagged release.
 #
 # Pushing a tag matching v* (e.g. `git tag v1.0.0 && git push --tags`)
-# additionally packages each platform's build into a zip and publishes them
-# on a GitHub Release for that tag — a stable, permanent download location
-# with no login required and no 90-day artifact expiry, unlike the
-# per-workflow-run artifacts above.
+# instead packages each platform's build into a zip (`release-<platform>`)
+# and publishes them on a GitHub Release for that tag — a stable,
+# permanent download location with no login required and no 90-day
+# artifact expiry. The plain `remote_helm-<platform>` artifacts are skipped
+# on tag pushes, since they'd just be an unzipped duplicate of what's
+# already attached to the Release.
 on:
   push:
   workflow_dispatch:
@@ -42,6 +47,7 @@ jobs:
         run: flutter build linux --release
 
       - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
         with:
           name: remote_helm-linux
           path: build/linux/x64/release/bundle/
@@ -77,6 +83,7 @@ jobs:
         run: flutter build windows --release
 
       - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
         with:
           name: remote_helm-windows
           path: build/windows/x64/runner/Release/
@@ -115,6 +122,7 @@ jobs:
         run: flutter build apk --release
 
       - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
         with:
           name: remote_helm-android
           path: build/app/outputs/flutter-apk/app-release.apk
