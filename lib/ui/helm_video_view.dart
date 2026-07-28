@@ -21,8 +21,20 @@ import 'package:video_player/video_player.dart';
 /// up with the live feed rather than buffering, which is what we want for
 /// a remote-control video feed (staleness is worse than an occasional
 /// dropped frame).
+///
+/// `player: {'avformat.rtsp_transport': 'udp'}` overrides fvp's own default
+/// of `'tcp'` (see its `video_player_mdk.dart`) — the plotter's RTSP server
+/// only implements UDP transport and returns `461 Unsupported transport` for
+/// TCP-interleaved, so without this override every stream fails to open at
+/// all (confirmed against a real plotter: `PlatformException(media open
+/// error, invalid or unsupported media, ...)`).
 void registerHelmVideoPlayer() {
-  fvp.registerWith(options: const {'lowLatency': 2});
+  fvp.registerWith(
+    options: const {
+      'lowLatency': 2,
+      'player': {'avformat.rtsp_transport': 'udp'},
+    },
+  );
 }
 
 /// Reports on video lifecycle so the parent (which owns the Helm session)
@@ -93,7 +105,9 @@ class HelmVideoViewState extends State<HelmVideoView> {
       // stream drop, since RTSP EOS behavior varies by backend.
       _controller = controller;
       _setStatus(HelmVideoStatus.playing);
-    } catch (_) {
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('HelmVideoView: failed to initialize $url: $e\n$st');
       await controller.dispose();
       if (!_disposed) _setStatus(HelmVideoStatus.error);
     }
@@ -103,6 +117,8 @@ class HelmVideoViewState extends State<HelmVideoView> {
     final c = _controller;
     if (c == null) return;
     if (c.value.hasError) {
+      // ignore: avoid_print
+      print('HelmVideoView: player error: ${c.value.errorDescription}');
       _setStatus(HelmVideoStatus.error);
     }
   }
