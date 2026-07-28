@@ -177,13 +177,13 @@ packages:
     source: hosted
     version: "4.1.2"
   jni:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       name: jni
-      sha256: ca1efa31ef27a0b8ecbb4f8dcf3785e5ad1b8a54c64af9b72d287ae81f93a4f4
+      sha256: "5bc9a9daac5ccfbd6a758377600b9f7fdce13d93f26e8012a8941014a5d978d1"
       url: "https://pub.dev"
     source: hosted
-    version: "1.0.1"
+    version: "1.0.2"
   jni_flutter:
     dependency: transitive
     description:

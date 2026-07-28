@@ -74,6 +74,16 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+# fvp pulls in jni_flutter -> jni transitively. jni 1.0.1 (fvp's resolved
+# version at the time this was written) unconditionally uses a Gradle
+# `kotlin { ... }` DSL block that only exists if the kotlin-android plugin
+# was applied, which jni's own build.gradle skips for AGP >= 9 — breaking
+# `flutter build apk` with "Could not find method kotlin()" on any project
+# using a recent Android Gradle Plugin (ours is 9.0.1). jni 1.0.2 reverts
+# that change ("Revert an unnecessary (and breaking) KGP migration").
+dependency_overrides:
+  jni: ^1.0.2
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
