@@ -8,9 +8,17 @@
 /// Ported from the Python reference implementation
 /// (github.com/Mrkvak/helm-linux, `helm/discovery.py`), but built on the
 /// official `multicast_dns` package instead of hand-rolled DNS parsing.
+///
+/// This file is deliberately pure Dart (no `package:flutter` in its import
+/// chain) so it also works from a plain `dart run` context, such as
+/// `bin/helm_cli.dart` — used to verify the protocol layer against a real
+/// plotter without needing the Flutter engine at all. Android's
+/// WifiManager MulticastLock requirement (see [browse]'s `withMulticastLock`
+/// parameter) is therefore handled via an injected callback rather than a
+/// direct `flutter_multicast_lock` import, which pulls in `package:flutter`
+/// (and `dart:ui`, unavailable outside the Flutter engine) transitively.
 library;
 
-import 'package:flutter_multicast_lock/flutter_multicast_lock.dart';
 import 'package:multicast_dns/multicast_dns.dart';
 
 const String helmService = '_garmin-helm._tcp.local';
@@ -70,17 +78,31 @@ class HelmServiceInfo {
 /// Browses the network for Garmin services. Defaults to just the Helm
 /// service type; pass [garminServiceTypes] to see everything Garmin
 /// advertises on the network.
+///
+/// Android drops incoming multicast UDP packets unless a WifiManager
+/// MulticastLock is held; `multicast_dns` doesn't acquire one itself, so on
+/// Android the caller must pass [withMulticastLock] — a function that
+/// acquires the lock, runs the given body, and releases it afterwards (see
+/// `ui/android_multicast.dart` for the Flutter-side implementation using
+/// `flutter_multicast_lock`). Left null (the default) on platforms that
+/// don't need it, or for pure-Dart callers like `bin/helm_cli.dart`.
 Future<List<HelmServiceInfo>> browse({
   List<String> serviceTypes = const [helmService],
   Duration timeout = const Duration(seconds: 4),
+  Future<T> Function<T>(Future<T> Function() body)? withMulticastLock,
 }) async {
-  // Android drops incoming multicast UDP packets unless a WifiManager
-  // MulticastLock is held; multicast_dns doesn't acquire one itself, so
-  // without this the query goes out but replies are silently never
-  // delivered on Android (a no-op on other platforms).
-  final multicastLock = FlutterMulticastLock();
-  await multicastLock.acquireMulticastLock();
+  if (withMulticastLock != null) {
+    return withMulticastLock(
+      () => _browse(serviceTypes: serviceTypes, timeout: timeout),
+    );
+  }
+  return _browse(serviceTypes: serviceTypes, timeout: timeout);
+}
 
+Future<List<HelmServiceInfo>> _browse({
+  required List<String> serviceTypes,
+  required Duration timeout,
+}) async {
   final client = MDnsClient();
   await client.start();
   try {
@@ -148,7 +170,6 @@ Future<List<HelmServiceInfo>> browse({
     return found.values.toList();
   } finally {
     client.stop();
-    await multicastLock.releaseMulticastLock();
   }
 }
 

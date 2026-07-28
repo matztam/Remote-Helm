@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helm/discovery.dart';
 import '../helm/helm_client.dart';
+import 'android_multicast.dart';
 
 enum HelmSessionState { idle, discovering, connecting, connected, error }
 
@@ -52,7 +53,10 @@ class HelmSessionController extends ChangeNotifier {
   }) async {
     _setState(HelmSessionState.discovering, message: 'Searching for plotters…');
     try {
-      final results = await browse(timeout: timeout);
+      final results = await browse(
+        timeout: timeout,
+        withMulticastLock: withAndroidMulticastLock,
+      );
       _setState(
         _state == HelmSessionState.discovering ? HelmSessionState.idle : _state,
       );
