@@ -4,6 +4,7 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../helm/discovery.dart';
 import 'helm_session_controller.dart';
@@ -29,6 +30,11 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> {
     super.initState();
     _session.addListener(_onSessionChanged);
     _controlsVisible = isDesktopPlatform; // Android starts hidden (immersive)
+    // This is meant to run full-screen on a tablet mounted at the helm —
+    // the screen timing out mid-use would defeat the point. Held only for
+    // this screen's lifetime, not globally, so it releases automatically
+    // if the app is ever backgrounded or closed.
+    WakelockPlus.enable();
     _init();
   }
 
@@ -63,6 +69,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> {
 
   @override
   void dispose() {
+    WakelockPlus.disable();
     _session.removeListener(_onSessionChanged);
     _session.dispose();
     _hostController.dispose();

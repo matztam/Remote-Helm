@@ -63,6 +63,12 @@ dependencies:
   # desktop platforms.
   flutter_multicast_lock: ^1.2.1
 
+  # Keeps the screen on while the app is in the foreground — this is meant
+  # to run full-screen on a tablet mounted at the helm, so the screen
+  # timing out mid-use would defeat the point. Enabled/disabled with the
+  # app's own lifecycle (see ui/helm_home_screen.dart), not held globally.
+  wakelock_plus: ^1.3.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
