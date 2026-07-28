@@ -55,6 +55,17 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   layout) set to **"View and Control"** — "View only" will pair and show
   video but touch input will silently do nothing.
 
+## Downloads
+
+Prebuilt binaries for all three platforms are published on the
+[Releases page](https://github.com/matztam/remote_helm/releases) whenever
+a version is tagged. If you'd rather grab the latest build off `master`
+without waiting for a tagged release, every push also builds all three
+platforms in [Actions](https://github.com/matztam/remote_helm/actions) —
+open the newest successful "Build" run and download the platform you want
+from its Artifacts section (requires being signed in to GitHub; tagged
+Releases don't).
+
 ## Building
 
 This is a standard Flutter project targeting Windows, Linux, and Android.
@@ -73,10 +84,11 @@ flutter build apk --release
 ```
 
 Windows can't be cross-compiled from Linux/macOS — building it requires an
-actual Windows host. This repo includes a GitHub Actions workflow
-(`.github/workflows/windows-build.yml`) that builds it on a hosted Windows
-runner on every push and uploads the result as a downloadable artifact, if
-you don't have a Windows machine handy.
+actual Windows host. This repo's GitHub Actions workflow
+(`.github/workflows/build.yml`) builds all three platforms (Linux, Windows,
+Android) on their own appropriately-hosted runners on every push, so you
+don't need a Windows machine or an Android SDK set up locally just to get
+a build — see [Downloads](#downloads) above.
 
 ### Android build note
 
