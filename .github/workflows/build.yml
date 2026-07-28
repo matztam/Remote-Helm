@@ -6,9 +6,18 @@ run-name: Build (Linux/Windows/Android)
 # downloadable workflow artifact. Windows and Linux desktop builds can't be
 # cross-compiled from one host, so each platform gets its own
 # appropriately-hosted runner.
+#
+# Pushing a tag matching v* (e.g. `git tag v1.0.0 && git push --tags`)
+# additionally packages each platform's build into a zip and publishes them
+# on a GitHub Release for that tag — a stable, permanent download location
+# with no login required and no 90-day artifact expiry, unlike the
+# per-workflow-run artifacts above.
 on:
   push:
   workflow_dispatch:
+
+permissions:
+  contents: write # needed by the release job to create/attach to a GitHub Release
 
 jobs:
   build-linux:
@@ -38,6 +47,19 @@ jobs:
           path: build/linux/x64/release/bundle/
           if-no-files-found: error
 
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd build/linux/x64/release/bundle
+          zip -r "$GITHUB_WORKSPACE/remote_helm-linux.zip" .
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-linux
+          path: remote_helm-linux.zip
+          if-no-files-found: error
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -58,6 +80,17 @@ jobs:
         with:
           name: remote_helm-windows
           path: build/windows/x64/runner/Release/
+          if-no-files-found: error
+
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath remote_helm-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-windows
+          path: remote_helm-windows.zip
           if-no-files-found: error
 
   build-android:
@@ -86,3 +119,30 @@ jobs:
           name: remote_helm-android
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+
+      - name: Copy for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cp build/app/outputs/flutter-apk/app-release.apk remote_helm-android.apk
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-android
+          path: remote_helm-android.apk
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux, build-windows, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
