@@ -1,4 +1,5 @@
 name: Build
+run-name: Build (Linux/Windows/Android)
 
 # Runs on every push and can also be triggered manually from the Actions
 # tab. Builds all three supported platforms and uploads each as a
