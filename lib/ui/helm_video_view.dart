@@ -9,35 +9,41 @@
 /// RTSP support, and the plotter's RTSP server only offers UDP transport
 /// (`RTP/AVP/UDP`; TCP-interleaved gets `461 Unsupported transport`).
 ///
-/// ## The 30-second session timeout
+/// ## The 1-second keepalive requirement
 ///
-/// The plotter closes the RTSP session — and with it, the RTP video stream —
-/// exactly ~30s after `PLAY`, confirmed via packet capture across several
-/// independent attempts to prevent it:
-///  1. No keepalive at all: TCP FIN from the plotter 30s after the last
-///     control-channel byte; RTP stops in the same instant.
-///  2. A keepalive (`OPTIONS`, with the correct `Session:` id) on a second,
-///     independent connection: that connection stays open indefinitely, but
-///     the player's own connection — and the video — still dies at 30s. The
-///     timeout is tied to the specific connection carrying `PLAY`, not just
-///     the session id.
-///  3. A keepalive injected onto the *same* connection as the player's own
-///     traffic (via a local proxy `HelmVideoView` routed video through):
-///     still cut off at ~29.8s from `PLAY`, despite the plotter answering
-///     every injected `OPTIONS` with `200 OK` right up to the FIN.
+/// The plotter tears down the RTSP session — and with it, the RTP video
+/// stream — unless it sees an RTSP request on the *specific connection that
+/// carried `PLAY`* roughly once per second. This is much stricter than a
+/// typical RTSP keepalive convention (most servers tolerate tens of seconds
+/// of silence), which is why it took a while to pin down:
+///  1. No keepalive at all: TCP FIN from the plotter ~30s after PLAY; RTP
+///     stops in the same instant.
+///  2. A keepalive on a second, independent connection (even with the
+///     correct `Session:` id): that connection stays open indefinitely, but
+///     the connection carrying PLAY — and the video — still dies at 30s.
+///  3. Looser-interval keepalives on the PLAY connection itself (every
+///     25-30s): still didn't prevent the cutoff.
+///  4. A standalone test client sending a strict `OPTIONS` every 1 second
+///     on the PLAY connection: keeps both the control connection and RTP
+///     video flowing indefinitely (verified 90+ continuous seconds against
+///     the real plotter, zero drops). Confirmed this matches the real
+///     Garmin ActiveCaptain app's own traffic exactly (packet capture: it
+///     sends `OPTIONS` once per second on the PLAY connection for as long
+///     as its video view is open).
 ///
-/// Conclusion: this is a fixed, non-negotiable session lifetime from `PLAY`,
-/// not an inactivity timeout any client-side keepalive can prevent. `video_
-/// player`/`fvp` also don't reliably surface the resulting stream death as
-/// `hasError` — the video simply freezes on the last frame (Linux) or goes
-/// black (Android, where the hardware decoder is torn down) with no
-/// exception. So instead of fighting the timeout, this widget just
-/// reconnects proactively, comfortably before the deadline: every
-/// [_reconnectInterval] (25s — a 5s margin under the ~30s observed cutoff),
-/// it tears down and rebuilds the whole `VideoPlayerController` from
-/// scratch. There's a brief visible reconnect (a spinner, typically well
-/// under a second on the same LAN), but that's a much smaller problem than
-/// an indefinitely frozen/black screen.
+/// `video_player`/`fvp` don't drive frequent-enough keepalive traffic on
+/// their own to satisfy this, so [HelmVideoView] doesn't connect the player
+/// directly to the plotter. Instead it starts a local [RtspKeepaliveProxy]
+/// and points the player at `rtsp://127.0.0.1:<port>/...`; the proxy
+/// forwards everything transparently and injects the 1-second `OPTIONS`
+/// keepalive on the player's behalf, on the same connection as its PLAY.
+///
+/// `video_player`/`fvp` also don't reliably surface a stream drop as
+/// `hasError` — a dead stream just freezes on the last frame (Linux) or
+/// goes black (Android, where the hardware decoder is torn down) with no
+/// exception. [_onControllerUpdate] still watches for `hasError` as a
+/// backstop, but with the keepalive proxy in place this shouldn't fire in
+/// normal operation.
 library;
 
 import 'dart:async';
@@ -45,6 +51,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:fvp/fvp.dart' as fvp;
 import 'package:video_player/video_player.dart';
+
+import '../helm/rtsp_keepalive_proxy.dart';
 
 /// Registers fvp as the video_player platform implementation. Call this once
 /// at app startup, before any [HelmVideoView] is built.
@@ -112,15 +120,10 @@ class HelmVideoView extends StatefulWidget {
 }
 
 class HelmVideoViewState extends State<HelmVideoView> {
-  // 5s margin under the ~29.8-30s session cutoff observed against a real
-  // plotter (see this file's top doc comment for why a keepalive can't
-  // avoid this reconnect entirely).
-  static const _reconnectInterval = Duration(seconds: 25);
-
   VideoPlayerController? _controller;
+  RtspKeepaliveProxy? _proxy;
   HelmVideoStatus _status = HelmVideoStatus.connecting;
   bool _disposed = false;
-  Timer? _reconnectTimer;
 
   @override
   void initState() {
@@ -139,8 +142,8 @@ class HelmVideoViewState extends State<HelmVideoView> {
   @override
   void dispose() {
     _disposed = true;
-    _reconnectTimer?.cancel();
     _controller?.dispose();
+    _proxy?.stop();
     super.dispose();
   }
 
@@ -151,13 +154,29 @@ class HelmVideoViewState extends State<HelmVideoView> {
   }
 
   Future<void> _start(String url) async {
-    _reconnectTimer?.cancel();
-    final old = _controller;
+    final oldController = _controller;
+    final oldProxy = _proxy;
     _controller = null;
-    await old?.dispose();
+    _proxy = null;
+    await oldController?.dispose();
+    await oldProxy?.stop();
 
     _setStatus(HelmVideoStatus.connecting);
-    final controller = VideoPlayerController.networkUrl(Uri.parse(url));
+
+    final plotterUri = Uri.parse(url);
+    final proxy = RtspKeepaliveProxy(
+      realHost: plotterUri.host,
+      realPort: plotterUri.hasPort ? plotterUri.port : 554,
+    );
+    final localPort = await proxy.start();
+    if (_disposed) {
+      await proxy.stop();
+      return;
+    }
+    _proxy = proxy;
+    final proxiedUrl = 'rtsp://127.0.0.1:$localPort${plotterUri.path}';
+
+    final controller = VideoPlayerController.networkUrl(Uri.parse(proxiedUrl));
     controller.addListener(_onControllerUpdate);
     try {
       await controller.initialize();
@@ -166,20 +185,13 @@ class HelmVideoViewState extends State<HelmVideoView> {
         return;
       }
       await controller.play();
-      // Loop isn't meaningful for a live feed, but setLooping(false) (the
-      // default) plus a hasError check below is what actually detects a
-      // stream drop, since RTSP EOS behavior varies by backend — and
-      // neither reliably catches the plotter's 30s session cutoff (see the
-      // top doc comment), which is why _reconnectTimer below exists at all.
       _controller = controller;
       _setStatus(HelmVideoStatus.playing);
-      _reconnectTimer = Timer(_reconnectInterval, () {
-        if (!_disposed) _start(widget.rtspUrl);
-      });
     } catch (e, st) {
       // ignore: avoid_print
-      print('HelmVideoView: failed to initialize $url: $e\n$st');
+      print('HelmVideoView: failed to initialize $proxiedUrl: $e\n$st');
       await controller.dispose();
+      await proxy.stop();
       if (!_disposed) _setStatus(HelmVideoStatus.error);
     }
   }
