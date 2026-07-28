@@ -1,0 +1,31 @@
+name: Windows build
+
+# Runs on every push and can also be triggered manually from the Actions
+# tab. Flutter has no cross-compiler for Windows desktop, so this has to
+# run on an actual windows-latest GitHub-hosted runner.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.8
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build windows
+        run: flutter build windows --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote_helm-windows
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
