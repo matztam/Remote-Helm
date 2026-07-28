@@ -9,35 +9,28 @@
 /// RTSP support, and the plotter's RTSP server only offers UDP transport
 /// (`RTP/AVP/UDP`; TCP-interleaved gets `461 Unsupported transport`).
 ///
-/// ## Why there's a local proxy in front of the plotter at all
+/// ## No local proxy — connects directly to the plotter
 ///
-/// There's no plotter-side RTSP keepalive requirement beyond what `fvp`/mdk
-/// already does on its own: mdk (via the FFmpeg build it bundles) sends its
-/// own RTSP `OPTIONS` keepalive every 30 seconds, same as a plain
-/// `ffplay`/FFmpeg client. The actual cause of what looked like a video
-/// freeze/blackout ~30s after `PLAY` had nothing to do with this widget or
-/// the RTSP connection at all — it was the plotter's touch/control channel
-/// (`HelmClient`, port 51200, a completely separate connection) killing the
-/// *whole session*, video included, when it stopped seeing touch activity
-/// after the initial context handshake. See `helm_client.dart`'s doc
-/// comment for the full story (it took a long, wrong-turn-heavy
-/// investigation — RTSP/RTCP keepalive theories, a full UDP relay, packet
-/// captures of `ffplay` vs. mdk — before a step-by-step handshake rebuild
-/// pointed at the real connection). `HelmClient` now sends a periodic
-/// no-op touch frame once its context is granted, which fixes this at the
-/// source; nothing about the RTSP/video path itself needed to change.
+/// This widget used to route the player through a local
+/// `RtspKeepaliveProxy` (`rtsp://127.0.0.1:<port>/...`) to work around a
+/// video freeze/blackout that appeared ~30s after `PLAY`. That extra hop
+/// turned out to be unnecessary *and* costly: the freeze's real cause
+/// was never on this connection at all — it was the plotter's separate
+/// touch/control channel (`HelmClient`, port 51200) killing the whole
+/// session, video included, when it stopped seeing touch activity after
+/// the initial context handshake. See `helm_client.dart`'s doc comment for
+/// the full investigation. `HelmClient` now sends a periodic no-op touch
+/// frame once its context is granted, which fixes the freeze at the
+/// source — there is no plotter-side RTSP keepalive requirement beyond
+/// what `fvp`/mdk already does on its own (mdk sends its own RTSP
+/// `OPTIONS` every 30s, same as a plain `ffplay`/FFmpeg client).
 ///
-/// Along the way, this file's [RtspKeepaliveProxy] carried a real,
-/// independent bug worth fixing regardless: it could forward a fragmented
-/// RTSP request's bytes twice (once as raw bytes on arrival, again from its
-/// parse buffer once the request completed), silently corrupting whatever
-/// request happened to arrive split across TCP reads. That's fixed, and
-/// [RtspKeepaliveProxy] is a plain, transparent byte-for-byte relay now —
-/// but fixing it alone did not resolve the freeze, since the freeze's real
-/// cause was on the touch channel the whole time. The proxy itself exists
-/// only because `video_player`/`fvp` need a stable local URL to connect to
-/// (there's no other reason to route through localhost instead of the
-/// plotter directly).
+/// With the freeze fixed at its actual source, routing every video byte
+/// through an extra local TCP hop was pure overhead: after wiring the
+/// touch keepalive, the video was stable but control input lagged
+/// noticeably worse than earlier in this project's history, when the
+/// player connected to the plotter directly. Removing the proxy (this
+/// version) restores the direct connection.
 ///
 /// `video_player`/`fvp` don't reliably surface a stream drop as
 /// `hasError` — a dead stream just freezes on the last frame (Linux) or
@@ -46,13 +39,9 @@
 /// backstop.
 library;
 
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:fvp/fvp.dart' as fvp;
 import 'package:video_player/video_player.dart';
-
-import '../helm/rtsp_keepalive_proxy.dart';
 
 /// Registers fvp as the video_player platform implementation. Call this once
 /// at app startup, before any [HelmVideoView] is built.
@@ -121,7 +110,6 @@ class HelmVideoView extends StatefulWidget {
 
 class HelmVideoViewState extends State<HelmVideoView> {
   VideoPlayerController? _controller;
-  RtspKeepaliveProxy? _proxy;
   HelmVideoStatus _status = HelmVideoStatus.connecting;
   bool _disposed = false;
 
@@ -143,7 +131,6 @@ class HelmVideoViewState extends State<HelmVideoView> {
   void dispose() {
     _disposed = true;
     _controller?.dispose();
-    _proxy?.stop();
     super.dispose();
   }
 
@@ -155,28 +142,12 @@ class HelmVideoViewState extends State<HelmVideoView> {
 
   Future<void> _start(String url) async {
     final oldController = _controller;
-    final oldProxy = _proxy;
     _controller = null;
-    _proxy = null;
     await oldController?.dispose();
-    await oldProxy?.stop();
 
     _setStatus(HelmVideoStatus.connecting);
 
-    final plotterUri = Uri.parse(url);
-    final proxy = RtspKeepaliveProxy(
-      realHost: plotterUri.host,
-      realPort: plotterUri.hasPort ? plotterUri.port : 554,
-    );
-    final localPort = await proxy.start();
-    if (_disposed) {
-      await proxy.stop();
-      return;
-    }
-    _proxy = proxy;
-    final proxiedUrl = 'rtsp://127.0.0.1:$localPort${plotterUri.path}';
-
-    final controller = VideoPlayerController.networkUrl(Uri.parse(proxiedUrl));
+    final controller = VideoPlayerController.networkUrl(Uri.parse(url));
     controller.addListener(_onControllerUpdate);
     try {
       await controller.initialize();
@@ -189,9 +160,8 @@ class HelmVideoViewState extends State<HelmVideoView> {
       _setStatus(HelmVideoStatus.playing);
     } catch (e, st) {
       // ignore: avoid_print
-      print('HelmVideoView: failed to initialize $proxiedUrl: $e\n$st');
+      print('HelmVideoView: failed to initialize $url: $e\n$st');
       await controller.dispose();
-      await proxy.stop();
       if (!_disposed) _setStatus(HelmVideoStatus.error);
     }
   }

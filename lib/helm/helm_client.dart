@@ -116,12 +116,19 @@ class HelmClient {
     if (touchCtx != null) _startKeepalive();
   }
 
-  /// Sends an inert touch-up frame once a second for as long as this client
+  /// Sends an inert touch-up frame periodically for as long as this client
   /// is connected — see this file's top doc comment for why the plotter
   /// needs this to keep the RTSP video stream alive.
+  ///
+  /// DEBUG: testing a 5s interval instead of 1s — every synthetic touch
+  /// frame appears to make the plotter do enough work that it visibly
+  /// stutters the video (confirmed: no keepalive at all = smooth video, 1s
+  /// keepalive = a ~3.1s RTP stutter throughout the session). 5s is still
+  /// comfortably under the ~30s window observed before the plotter drops
+  /// the session.
   void _startKeepalive() {
     _keepaliveTimer?.cancel();
-    _keepaliveTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _keepaliveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       final ctx = touchCtx;
       if (ctx == null) return;
       _send(tTouch, encodeTouch(ctx, 0.0, 0.0, false));

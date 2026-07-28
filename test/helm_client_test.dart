@@ -54,7 +54,7 @@ void main() {
     final touchCountAfterHandshake = receivedTypes.where((t) => t == tTouch).length;
     expect(touchCountAfterHandshake, 0);
 
-    await Future<void>.delayed(const Duration(milliseconds: 2200));
+    await Future<void>.delayed(const Duration(milliseconds: 10200));
 
     final touchCountAfterWait = receivedTypes.where((t) => t == tTouch).length;
     expect(touchCountAfterWait, greaterThanOrEqualTo(2));
