@@ -9,41 +9,41 @@
 /// RTSP support, and the plotter's RTSP server only offers UDP transport
 /// (`RTP/AVP/UDP`; TCP-interleaved gets `461 Unsupported transport`).
 ///
-/// ## The 1-second keepalive requirement
+/// ## Why there's a local proxy in front of the plotter at all
 ///
-/// The plotter tears down the RTSP session — and with it, the RTP video
-/// stream — unless it sees an RTSP request on the *specific connection that
-/// carried `PLAY`* roughly once per second. This is much stricter than a
-/// typical RTSP keepalive convention (most servers tolerate tens of seconds
-/// of silence), which is why it took a while to pin down:
-///  1. No keepalive at all: TCP FIN from the plotter ~30s after PLAY; RTP
-///     stops in the same instant.
-///  2. A keepalive on a second, independent connection (even with the
-///     correct `Session:` id): that connection stays open indefinitely, but
-///     the connection carrying PLAY — and the video — still dies at 30s.
-///  3. Looser-interval keepalives on the PLAY connection itself (every
-///     25-30s): still didn't prevent the cutoff.
-///  4. A standalone test client sending a strict `OPTIONS` every 1 second
-///     on the PLAY connection: keeps both the control connection and RTP
-///     video flowing indefinitely (verified 90+ continuous seconds against
-///     the real plotter, zero drops). Confirmed this matches the real
-///     Garmin ActiveCaptain app's own traffic exactly (packet capture: it
-///     sends `OPTIONS` once per second on the PLAY connection for as long
-///     as its video view is open).
+/// There's no plotter-side RTSP keepalive requirement beyond what `fvp`/mdk
+/// already does on its own: mdk (via the FFmpeg build it bundles) sends its
+/// own RTSP `OPTIONS` keepalive every 30 seconds, same as a plain
+/// `ffplay`/FFmpeg client. The actual cause of what looked like a video
+/// freeze/blackout ~30s after `PLAY` had nothing to do with this widget or
+/// the RTSP connection at all — it was the plotter's touch/control channel
+/// (`HelmClient`, port 51200, a completely separate connection) killing the
+/// *whole session*, video included, when it stopped seeing touch activity
+/// after the initial context handshake. See `helm_client.dart`'s doc
+/// comment for the full story (it took a long, wrong-turn-heavy
+/// investigation — RTSP/RTCP keepalive theories, a full UDP relay, packet
+/// captures of `ffplay` vs. mdk — before a step-by-step handshake rebuild
+/// pointed at the real connection). `HelmClient` now sends a periodic
+/// no-op touch frame once its context is granted, which fixes this at the
+/// source; nothing about the RTSP/video path itself needed to change.
 ///
-/// `video_player`/`fvp` don't drive frequent-enough keepalive traffic on
-/// their own to satisfy this, so [HelmVideoView] doesn't connect the player
-/// directly to the plotter. Instead it starts a local [RtspKeepaliveProxy]
-/// and points the player at `rtsp://127.0.0.1:<port>/...`; the proxy
-/// forwards everything transparently and injects the 1-second `OPTIONS`
-/// keepalive on the player's behalf, on the same connection as its PLAY.
+/// Along the way, this file's [RtspKeepaliveProxy] carried a real,
+/// independent bug worth fixing regardless: it could forward a fragmented
+/// RTSP request's bytes twice (once as raw bytes on arrival, again from its
+/// parse buffer once the request completed), silently corrupting whatever
+/// request happened to arrive split across TCP reads. That's fixed, and
+/// [RtspKeepaliveProxy] is a plain, transparent byte-for-byte relay now —
+/// but fixing it alone did not resolve the freeze, since the freeze's real
+/// cause was on the touch channel the whole time. The proxy itself exists
+/// only because `video_player`/`fvp` need a stable local URL to connect to
+/// (there's no other reason to route through localhost instead of the
+/// plotter directly).
 ///
-/// `video_player`/`fvp` also don't reliably surface a stream drop as
+/// `video_player`/`fvp` don't reliably surface a stream drop as
 /// `hasError` — a dead stream just freezes on the last frame (Linux) or
 /// goes black (Android, where the hardware decoder is torn down) with no
 /// exception. [_onControllerUpdate] still watches for `hasError` as a
-/// backstop, but with the keepalive proxy in place this shouldn't fire in
-/// normal operation.
+/// backstop.
 library;
 
 import 'dart:async';

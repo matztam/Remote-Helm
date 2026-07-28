@@ -1,66 +1,70 @@
-/// A transparent local TCP proxy that sits between the video player and the
-/// plotter's RTSP control connection (port 554), injecting an `OPTIONS`
-/// keepalive once per second on the *same* connection the player's own
-/// requests go out on.
+/// A transparent local TCP proxy for the plotter's RTSP control connection
+/// (port 554). The player connects to `rtsp://127.0.0.1:<port>/...` instead
+/// of the plotter directly; every byte is forwarded unmodified in both
+/// directions.
 ///
-/// ## Why this exists
+/// ## Why this exists, and why it's this simple
 ///
-/// The plotter does not use an inactivity timeout on the RTSP session — it
-/// disconnects unless it sees *some* RTSP request on the control connection
-/// roughly every second. This was hard to find because it's much stricter
-/// than a typical RTSP keepalive interval (the RTSP spec's `GET_PARAMETER`
-/// keepalive convention, and most server implementations, tolerate tens of
-/// seconds of silence). Confirmed by comparing against the real Garmin
-/// ActiveCaptain app's own traffic (packet capture): it sends `OPTIONS`
-/// exactly once per second on the PLAY connection, indefinitely, for as
-/// long as the video view is open.
+/// The plotter appeared to kill the RTP video stream ~30s after `PLAY`, and
+/// a lot of debugging went into "fixing" that before finding the real bug
+/// was in this proxy itself, not in what needed to be sent to the plotter:
 ///
-/// Earlier attempts that used looser intervals (a keepalive every ~25-30s,
-/// or on a separate connection from the one carrying PLAY) all failed —
-/// video would freeze/go black around the 30s mark regardless. That looked
-/// like a hard, non-negotiable server-side session limit, but it wasn't: a
-/// standalone test client sending strict 1-second `OPTIONS` on the *same*
-/// connection as PLAY keeps both the control connection and the RTP video
-/// stream alive indefinitely (verified 90+ seconds continuous RTP flow
-/// against the real plotter, zero drops). The earlier "hard limit"
-/// conclusion was simply wrong: it was under-testing keepalive frequency,
-/// not discovering a server invariant.
+///  1. Initial hypothesis: the plotter has some inactivity timeout on the
+///     RTSP control channel, so a client-side keepalive was needed. A
+///     standalone test client sending 1-second `OPTIONS` worked
+///     indefinitely, matching packet captures of the real Garmin
+///     ActiveCaptain app doing the same — but wiring an identical
+///     keepalive into a proxy in front of the real `fvp`/mdk player had no
+///     effect: still died at ~30s, even though the plotter kept answering
+///     every injected `OPTIONS` with `200 OK`.
+///  2. Comparing traffic against plain `ffplay` (which never froze)
+///     against the same plotter suggested `ffplay` sending RTCP receiver
+///     reports was the deciding factor, since `fvp`/mdk seemingly sent
+///     none. Implementing synthetic RTCP `RR` packets — first minimal,
+///     then with a correct SSRC, then relayed via a full rewritten-SETUP
+///     UDP relay so the RR could originate from the exact registered
+///     client RTCP port (mirroring FFmpeg's `ff_rtp_check_and_send_back_rr`,
+///     confirmed by reading FFmpeg's own source) — each looked correct and
+///     each still died at ~30s against the real player, despite standalone
+///     tests of the same code succeeding for 90+ seconds every time.
+///  3. That inconsistency (isolated tests reliably passing, the real
+///     player reliably failing) was the tell that something about *how
+///     this proxy forwarded bytes* was the actual problem, not what was
+///     being sent over UDP. Testing mdk completely standalone — via a
+///     minimal C++ program linked directly against `libmdk.so`, bypassing
+///     Flutter/fvp/this proxy entirely — against the real plotter proved
+///     it conclusively: mdk sends its own RTSP `OPTIONS` keepalive every
+///     30 seconds, exactly like a plain FFmpeg-based client (`ffplay`
+///     does the same). It needs no help at all.
+///  4. So the proxy was the bug. The earlier version of this file's
+///     `_scanClientRequests` forwarded newly-arrived raw bytes immediately
+///     whenever the buffered data didn't yet form one complete RTSP
+///     request — while also leaving those same bytes in the string buffer
+///     it used for parsing. Once enough data arrived to complete the
+///     request, it forwarded `text.substring(0, totalLen)`, which
+///     included the bytes already forwarded moments earlier: a byte
+///     duplication bug. TCP is free to split any write across multiple
+///     reads, so this wasn't a rare edge case — it silently corrupted
+///     whatever request happened to arrive fragmented, including mdk's
+///     periodic `OPTIONS` keepalive, which is exactly the request whose
+///     corruption would show up as "the plotter closes the session ~30s
+///     after PLAY" (the first `OPTIONS` after the initial handshake is
+///     the first opportunity for this to bite).
 ///
-/// `video_player`/`fvp` (via mdk/FFmpeg) don't drive their own RTSP
-/// keepalive frequently enough to satisfy this on their own, so this proxy
-/// injects one independently of whatever the player itself sends. It sits
-/// transparently between player and plotter: the player connects to
-/// `rtsp://127.0.0.1:<localPort>/...` instead of the plotter directly, and
-/// every byte in both directions is forwarded unmodified except for the
-/// injected `OPTIONS` requests (and the plotter's responses to them, which
-/// are swallowed rather than forwarded, since the player never asked for
-/// them).
-///
-/// ## Implementation notes / past bugs fixed here
-///
-/// - The keepalive timer only starts after observing the player's own
-///   `PLAY` request go out (not immediately on connect). Starting
-///   immediately interleaves an `OPTIONS` into the middle of the player's
-///   own `OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY` handshake, which desyncs the
-///   plotter's RTSP request/response bookkeeping badly enough that `PLAY`
-///   is never reached and the connection resets. Confirmed via packet
-///   capture.
-/// - Response forwarding parses `Content-Length` and forwards the full
-///   body, not just up to the first `\r\n\r\n`. Splitting only on the
-///   header terminator truncates any response with a body — in practice,
-///   `DESCRIBE`'s SDP payload — leaving the player stuck waiting forever
-///   on a response it never fully received (visible as a "connecting"
-///   spinner that never resolves).
+/// None of the RTCP synthesis, SETUP rewriting, or UDP relaying from
+/// earlier iterations was ever necessary — every one of them was built
+/// chasing a symptom of this forwarding bug. Once each complete request is
+/// parsed out of the buffer and forwarded exactly once, mdk's own
+/// keepalive is sufficient and this proxy can go back to being a plain,
+/// transparent byte-for-byte relay.
 library;
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 class RtspKeepaliveProxy {
   final String realHost;
   final int realPort;
-  final Duration keepaliveInterval;
 
   ServerSocket? _server;
   final List<_ProxyConnection> _connections = [];
@@ -68,7 +72,6 @@ class RtspKeepaliveProxy {
   RtspKeepaliveProxy({
     required this.realHost,
     required this.realPort,
-    this.keepaliveInterval = const Duration(seconds: 1),
   });
 
   /// Starts listening locally and returns the port to connect to.
@@ -76,12 +79,7 @@ class RtspKeepaliveProxy {
     final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     _server = server;
     server.listen((client) {
-      final conn = _ProxyConnection(
-        client: client,
-        realHost: realHost,
-        realPort: realPort,
-        keepaliveInterval: keepaliveInterval,
-      );
+      final conn = _ProxyConnection(client: client, realHost: realHost, realPort: realPort);
       _connections.add(conn);
       conn.start().whenComplete(() => _connections.remove(conn));
     }, onError: (Object e) {
@@ -104,25 +102,14 @@ class _ProxyConnection {
   final Socket client;
   final String realHost;
   final int realPort;
-  final Duration keepaliveInterval;
 
   Socket? _upstream;
-  Timer? _keepaliveTimer;
-  bool _seenPlay = false;
   bool _closed = false;
-  int _upstreamCseqCounter = 100000; // Far outside the player's own CSeq range.
-
-  final StringBuffer _clientToUpstreamBuffer = StringBuffer();
-  final StringBuffer _upstreamToClientBuffer = StringBuffer();
-  final List<int> _injectedCseqs = [];
-  String? _sessionId;
-  String? _requestUri;
 
   _ProxyConnection({
     required this.client,
     required this.realHost,
     required this.realPort,
-    required this.keepaliveInterval,
   });
 
   Future<void> start() async {
@@ -132,13 +119,13 @@ class _ProxyConnection {
       _upstream = upstream;
 
       upstream.listen(
-        _onUpstreamData,
+        client.add,
         onError: (Object e) => close(),
         onDone: close,
         cancelOnError: true,
       );
       client.listen(
-        _onClientData,
+        upstream.add,
         onError: (Object e) => close(),
         onDone: close,
         cancelOnError: true,
@@ -150,103 +137,9 @@ class _ProxyConnection {
     }
   }
 
-  void _onClientData(List<int> data) {
-    final upstream = _upstream;
-    if (upstream == null) return;
-    upstream.add(data);
-
-    _clientToUpstreamBuffer.write(utf8.decode(data, allowMalformed: true));
-    _scanClientRequests();
-  }
-
-  void _scanClientRequests() {
-    while (true) {
-      final text = _clientToUpstreamBuffer.toString();
-      final headerEnd = text.indexOf('\r\n\r\n');
-      if (headerEnd == -1) return;
-      final headerPart = text.substring(0, headerEnd);
-      final contentLength = _contentLengthOf(headerPart);
-      final totalLen = headerEnd + 4 + contentLength;
-      if (text.length < totalLen) return;
-
-      final firstLine = headerPart.split('\r\n').first;
-      _requestUri ??= _extractUri(firstLine);
-      final sessMatch = RegExp(r'Session:\s*([^\r\n;]+)').firstMatch(headerPart);
-      if (sessMatch != null) _sessionId = sessMatch.group(1)?.trim();
-
-      if (firstLine.startsWith('PLAY') && !_seenPlay) {
-        _seenPlay = true;
-        _startKeepalive();
-      }
-
-      _clientToUpstreamBuffer.clear();
-      _clientToUpstreamBuffer.write(text.substring(totalLen));
-    }
-  }
-
-  void _startKeepalive() {
-    _keepaliveTimer?.cancel();
-    _keepaliveTimer = Timer.periodic(keepaliveInterval, (_) => _sendKeepalive());
-  }
-
-  void _sendKeepalive() {
-    final upstream = _upstream;
-    final uri = _requestUri;
-    if (upstream == null || uri == null || _closed) return;
-    final cseq = _upstreamCseqCounter++;
-    _injectedCseqs.add(cseq);
-    final req = StringBuffer()
-      ..write('OPTIONS $uri RTSP/1.0\r\n')
-      ..write('CSeq: $cseq\r\n');
-    if (_sessionId != null) req.write('Session: $_sessionId\r\n');
-    req.write('\r\n');
-    upstream.add(utf8.encode(req.toString()));
-  }
-
-  void _onUpstreamData(List<int> data) {
-    _upstreamToClientBuffer.write(utf8.decode(data, allowMalformed: true));
-    _forwardUpstreamResponses();
-  }
-
-  void _forwardUpstreamResponses() {
-    while (true) {
-      final text = _upstreamToClientBuffer.toString();
-      final headerEnd = text.indexOf('\r\n\r\n');
-      if (headerEnd == -1) return;
-      final headerPart = text.substring(0, headerEnd);
-      final contentLength = _contentLengthOf(headerPart);
-      final totalLen = headerEnd + 4 + contentLength;
-      if (text.length < totalLen) return;
-
-      final full = text.substring(0, totalLen);
-      _upstreamToClientBuffer.clear();
-      _upstreamToClientBuffer.write(text.substring(totalLen));
-
-      final cseqMatch = RegExp(r'CSeq:\s*(\d+)', caseSensitive: false).firstMatch(headerPart);
-      final cseq = cseqMatch != null ? int.tryParse(cseqMatch.group(1)!) : null;
-      if (cseq != null && _injectedCseqs.remove(cseq)) {
-        // Response to our own injected keepalive — swallow it, the player
-        // never sent this request and doesn't expect a reply to it.
-        continue;
-      }
-      client.add(utf8.encode(full));
-    }
-  }
-
-  static int _contentLengthOf(String headerPart) {
-    final match = RegExp(r'Content-Length:\s*(\d+)', caseSensitive: false).firstMatch(headerPart);
-    return match != null ? int.parse(match.group(1)!) : 0;
-  }
-
-  static String? _extractUri(String requestLine) {
-    final parts = requestLine.split(' ');
-    return parts.length >= 2 ? parts[1] : null;
-  }
-
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
-    _keepaliveTimer?.cancel();
     try {
       await client.close();
     } catch (_) {}

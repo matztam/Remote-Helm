@@ -16,6 +16,39 @@
 /// unread bytes for the life of the connection if the plotter keeps sending
 /// unsolicited frames — acceptable for a session that's normally closed
 /// within minutes to hours, not indefinitely long-lived.
+///
+/// ## Why this client sends a periodic no-op touch frame
+///
+/// After the handshake grants a touch context (`0x1645`/[touchCtx]), the
+/// plotter expects *some* touch activity to keep flowing on this connection
+/// — not as a requirement of the touch channel in isolation, but as a
+/// keepalive for the whole session, including the separate RTSP video
+/// stream running alongside it. Without it, the plotter kills the video
+/// (freeze on Linux, black screen on Android, no error surfaced by
+/// `video_player`/fvp) roughly 30s after the touch context was acquired,
+/// regardless of how healthy the RTSP control connection itself looks.
+///
+/// This took a long, wrong-turn-heavy investigation to find: many rounds
+/// of RTSP/RTCP keepalive experiments (documented in
+/// `rtsp_keepalive_proxy.dart`'s history) never touched the actual cause,
+/// because the real trigger lives entirely on this connection, not the
+/// video one. It was finally isolated with a step-by-step rebuild of the
+/// handshake in a minimal standalone app (sending `tHello`, then
+/// `+tToken`, then `+tSubscribe`, then `+tAcquire` one step at a time
+/// against the real plotter) — video stayed alive fine through every step
+/// except the last: adding `tAcquire` alone reproduced the freeze,
+/// independent of whether the client actively read the plotter's own
+/// response afterwards (ruling out a TCP backpressure/unread-socket
+/// explanation). Comparing against packet captures of the real Garmin
+/// ActiveCaptain app confirmed it sends frequent `0x164c` (tTouch) frames
+/// throughout an active session — plausibly real touch/gesture activity in
+/// those captures rather than a fixed-interval keepalive, but sending a
+/// synthetic no-op touch frame once a second reproduced the same
+/// stabilizing effect in the same standalone rebuild (verified 126+
+/// continuous seconds against the real plotter, versus ~30-33s without
+/// it). Sending `down: false` at a fixed, arbitrary position keeps this
+/// inert — it moves nothing on the plotter's screen, it's just activity on
+/// the wire.
 library;
 
 import 'dart:async';
@@ -39,6 +72,7 @@ class HelmClient {
   Socket? _socket;
   final BytesBuilder _rxBuf = BytesBuilder(copy: false);
   StreamSubscription<Uint8List>? _rxSub;
+  Timer? _keepaliveTimer;
 
   /// Plotter-assigned touch context id (from `0x1645`), 4 bytes, or null
   /// until the handshake completes successfully.
@@ -79,6 +113,19 @@ class HelmClient {
     // requested.
     _send(tAcquire);
     touchCtx = await _awaitContext(timeout);
+    if (touchCtx != null) _startKeepalive();
+  }
+
+  /// Sends an inert touch-up frame once a second for as long as this client
+  /// is connected — see this file's top doc comment for why the plotter
+  /// needs this to keep the RTSP video stream alive.
+  void _startKeepalive() {
+    _keepaliveTimer?.cancel();
+    _keepaliveTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final ctx = touchCtx;
+      if (ctx == null) return;
+      _send(tTouch, encodeTouch(ctx, 0.0, 0.0, false));
+    });
   }
 
   Future<Uint8List?> _awaitContext(Duration timeout) async {
@@ -217,6 +264,8 @@ class HelmClient {
   }
 
   void close() {
+    _keepaliveTimer?.cancel();
+    _keepaliveTimer = null;
     _rxSub?.cancel();
     _rxSub = null;
     _socket?.destroy();
