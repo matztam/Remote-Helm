@@ -21,6 +21,12 @@ and pairing flow (`lib/helm/credential.dart`) are ported from that project;
 without that prior reverse-engineering work this app wouldn't exist. Like
 `helm-linux`, this project is released under the MIT license.
 
+For the protocol itself — framing, handshake, touch/pinch encoding, the
+session keepalive, video — see `helm-linux`'s
+[PROTOCOL.md](https://github.com/Mrkvak/helm-linux/blob/master/PROTOCOL.md),
+kept there rather than duplicated here since this project's wire format is
+the same one it documents.
+
 If you only need a Linux desktop client (GTK/GStreamer or mpv-backed, no
 Flutter toolchain required), `helm-linux` is a lighter-weight option. This
 project exists for cross-platform reach (Windows, Linux, and Android from
@@ -136,6 +142,10 @@ dart run bin/helm_cli.dart helm --host <plotter-ip> --tap 0.5 0.5
   only. `video_player` has no RTSP support on its own, so `fvp` (an
   FFmpeg/mdk-based platform implementation) is registered in its place
   (`lib/ui/helm_video_view.dart`).
+
+For the full wire format this is all built on — exact frame layouts, the
+pairing protobuf, touch/pinch byte encoding — see `helm-linux`'s
+[PROTOCOL.md](https://github.com/Mrkvak/helm-linux/blob/master/PROTOCOL.md).
 
 ## License
 
