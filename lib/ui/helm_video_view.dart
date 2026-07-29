@@ -37,11 +37,43 @@
 /// goes black (Android, where the hardware decoder is torn down) with no
 /// exception. [_onControllerUpdate] still watches for `hasError` as a
 /// backstop.
+///
+/// ## Stall watchdog
+///
+/// Since a dropped stream (e.g. a Wi-Fi hiccup between the tablet and the
+/// plotter) usually doesn't raise `hasError` at all, this view also polls
+/// `controller.value.position` on a timer: while the controller reports
+/// `isPlaying`, that position must keep advancing. If it doesn't for
+/// [_stallThreshold] consecutive checks, the stream is presumed dead and
+/// [_start] is called again automatically — no user interaction (and no
+/// visible "Retry" button to notice/tap) required, since this is meant to
+/// run unattended at the helm. [isStalled] is the pure decision function,
+/// factored out so the polling logic is unit-testable without a real
+/// [VideoPlayerController].
 library;
+
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:fvp/fvp.dart' as fvp;
 import 'package:video_player/video_player.dart';
+
+/// Whether a video reporting [isPlaying] and last known position
+/// [lastPosition] should be considered stalled, given its current
+/// [position] — i.e. playback claims to be active but the position hasn't
+/// advanced. Returns `false` (never stalled) while not playing, since a
+/// paused/buffering video is expected to hold its position.
+///
+/// A pure function so the watchdog's actual decision logic can be tested
+/// directly, without needing a real (platform-backed) controller.
+bool isStalled({
+  required bool isPlaying,
+  required Duration? lastPosition,
+  required Duration? position,
+}) {
+  if (!isPlaying || lastPosition == null || position == null) return false;
+  return position <= lastPosition;
+}
 
 /// Registers fvp as the video_player platform implementation. Call this once
 /// at app startup, before any [HelmVideoView] is built.
@@ -132,6 +164,22 @@ class HelmVideoViewState extends State<HelmVideoView> {
   HelmVideoStatus _status = HelmVideoStatus.connecting;
   bool _disposed = false;
 
+  // Stall watchdog: polled independently of _onControllerUpdate (which only
+  // fires on player-driven value changes — a fully stalled player may stop
+  // producing those entirely, so polling on our own timer is what actually
+  // catches that case).
+  static const _watchdogInterval = Duration(seconds: 3);
+  Timer? _watchdogTimer;
+  Duration? _lastPosition;
+
+  // Backoff for reconnect attempts that themselves fail to reach a playing
+  // state again (e.g. the plotter is fully off Wi-Fi, not just hiccuping) —
+  // without this, a permanently unreachable plotter would retry every
+  // _watchdogInterval forever.
+  static const _minRetryDelay = Duration(seconds: 2);
+  static const _maxRetryDelay = Duration(seconds: 30);
+  Duration _retryDelay = _minRetryDelay;
+
   @override
   void initState() {
     super.initState();
@@ -149,6 +197,7 @@ class HelmVideoViewState extends State<HelmVideoView> {
   @override
   void dispose() {
     _disposed = true;
+    _watchdogTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -160,6 +209,9 @@ class HelmVideoViewState extends State<HelmVideoView> {
   }
 
   Future<void> _start(String url) async {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+
     final oldController = _controller;
     _controller = null;
     await oldController?.dispose();
@@ -178,11 +230,35 @@ class HelmVideoViewState extends State<HelmVideoView> {
       _controller = controller;
       _setStatus(HelmVideoStatus.playing);
       widget.onAspectRatioChanged?.call(controller.value.aspectRatio);
+      _retryDelay = _minRetryDelay;
+      _lastPosition = null;
+      _watchdogTimer = Timer.periodic(_watchdogInterval, (_) => _checkForStall());
     } catch (e, st) {
       // ignore: avoid_print
       print('HelmVideoView: failed to initialize $url: $e\n$st');
       await controller.dispose();
-      if (!_disposed) _setStatus(HelmVideoStatus.error);
+      if (!_disposed) {
+        _setStatus(HelmVideoStatus.error);
+        _scheduleRetry();
+      }
+    }
+  }
+
+  void _checkForStall() {
+    final c = _controller;
+    if (c == null) return;
+    final value = c.value;
+    final stalled = isStalled(
+      isPlaying: value.isPlaying,
+      lastPosition: _lastPosition,
+      position: value.position,
+    );
+    _lastPosition = value.position;
+    if (stalled) {
+      // ignore: avoid_print
+      print('HelmVideoView: stream stalled (position stuck at ${value.position}), reconnecting');
+      _setStatus(HelmVideoStatus.error);
+      _start(widget.rtspUrl);
     }
   }
 
@@ -193,7 +269,20 @@ class HelmVideoViewState extends State<HelmVideoView> {
       // ignore: avoid_print
       print('HelmVideoView: player error: ${c.value.errorDescription}');
       _setStatus(HelmVideoStatus.error);
+      _scheduleRetry();
     }
+  }
+
+  /// Schedules an automatic [reconnect] after [_retryDelay], doubling it
+  /// (capped at [_maxRetryDelay]) for next time — so a plotter that's fully
+  /// unreachable doesn't get hammered with reconnect attempts every few
+  /// seconds forever.
+  void _scheduleRetry() {
+    Future.delayed(_retryDelay, () {
+      if (_disposed) return;
+      _start(widget.rtspUrl);
+    });
+    _retryDelay = _retryDelay * 2 > _maxRetryDelay ? _maxRetryDelay : _retryDelay * 2;
   }
 
   /// Re-establishes the video connection (e.g. after an error, or a manual
