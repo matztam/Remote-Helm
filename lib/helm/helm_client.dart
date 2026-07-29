@@ -17,38 +17,52 @@
 /// unsolicited frames — acceptable for a session that's normally closed
 /// within minutes to hours, not indefinitely long-lived.
 ///
-/// ## Why this client sends a periodic no-op touch frame
+/// ## Why this client sends a periodic re-subscribe as a keepalive
 ///
 /// After the handshake grants a touch context (`0x1645`/[touchCtx]), the
-/// plotter expects *some* touch activity to keep flowing on this connection
-/// — not as a requirement of the touch channel in isolation, but as a
+/// plotter expects *some* activity to keep flowing on this connection —
+/// not as a requirement of the touch channel specifically, but as a
 /// keepalive for the whole session, including the separate RTSP video
 /// stream running alongside it. Without it, the plotter kills the video
 /// (freeze on Linux, black screen on Android, no error surfaced by
 /// `video_player`/fvp) roughly 30s after the touch context was acquired,
 /// regardless of how healthy the RTSP control connection itself looks.
+/// Reconfirmed directly against a real plotter by disabling this keepalive
+/// entirely: video froze again after ~30s, exactly as originally found.
 ///
-/// This took a long, wrong-turn-heavy investigation to find: many rounds
-/// of RTSP/RTCP keepalive experiments (documented in
-/// `rtsp_keepalive_proxy.dart`'s history) never touched the actual cause,
-/// because the real trigger lives entirely on this connection, not the
-/// video one. It was finally isolated with a step-by-step rebuild of the
+/// The actual trigger (some activity is required at all) took a long,
+/// wrong-turn-heavy investigation: many rounds of RTSP/RTCP keepalive
+/// experiments (documented in `rtsp_keepalive_proxy.dart`'s history) never
+/// touched the real cause, because it lives entirely on this connection,
+/// not the video one. It was isolated with a step-by-step rebuild of the
 /// handshake in a minimal standalone app (sending `tHello`, then
 /// `+tToken`, then `+tSubscribe`, then `+tAcquire` one step at a time
 /// against the real plotter) — video stayed alive fine through every step
-/// except the last: adding `tAcquire` alone reproduced the freeze,
-/// independent of whether the client actively read the plotter's own
-/// response afterwards (ruling out a TCP backpressure/unread-socket
-/// explanation). Comparing against packet captures of the real Garmin
-/// ActiveCaptain app confirmed it sends frequent `0x164c` (tTouch) frames
-/// throughout an active session — plausibly real touch/gesture activity in
-/// those captures rather than a fixed-interval keepalive, but sending a
-/// synthetic no-op touch frame once a second reproduced the same
-/// stabilizing effect in the same standalone rebuild (verified 126+
-/// continuous seconds against the real plotter, versus ~30-33s without
-/// it). Sending `down: false` at a fixed, arbitrary position keeps this
-/// inert — it moves nothing on the plotter's screen, it's just activity on
-/// the wire.
+/// except the last: adding `tAcquire` alone reproduced the freeze.
+///
+/// What to send as that activity went through two iterations:
+///
+/// 1. A synthetic no-op `tTouch` (`0x164c`) frame, initially, on the
+///    (wrong) assumption that this mirrored what the real app does —
+///    an earlier packet capture showed frequent `0x164c` frames, which
+///    turned out to just be real, active touch/drag input in that
+///    capture, not a keepalive. This worked for the freeze but introduced
+///    its own bug: a real device report showed the plotter tracking
+///    "last touch position" across the whole session including these
+///    synthetic frames, so a synthetic touch sent shortly before the
+///    user's next real tap made that tap silently register as a drag's
+///    tail end instead of a clean press — the user had to tap twice at
+///    the same spot to get a reaction.
+/// 2. What the real app actually sends, confirmed with a fresh, targeted
+///    capture of it: idle (screen untouched) for 65+ continuous seconds,
+///    it sends *no* `tTouch` at all, but exactly three `tSubscribe`
+///    (`0x1648`) frames — re-subscribing to indices `8, 10, 6`, already
+///    part of this client's own initial [subscribeIndices] — every 5.000s
+///    on the dot (13/13 bursts measured at 5.000s ±1ms, zero drift).
+///    That's what [_startKeepalive] replays. Being a completely different
+///    frame type than `tTouch`, it can't interact with touch/cursor state
+///    at all, which is why this approach has none of the synthetic-touch
+///    approach's side effects.
 library;
 
 import 'dart:async';
@@ -116,22 +130,26 @@ class HelmClient {
     if (touchCtx != null) _startKeepalive();
   }
 
-  /// Sends an inert touch-up frame periodically for as long as this client
-  /// is connected — see this file's top doc comment for why the plotter
-  /// needs this to keep the RTSP video stream alive.
-  ///
-  /// DEBUG: testing a 5s interval instead of 1s — every synthetic touch
-  /// frame appears to make the plotter do enough work that it visibly
-  /// stutters the video (confirmed: no keepalive at all = smooth video, 1s
-  /// keepalive = a ~3.1s RTP stutter throughout the session). 5s is still
-  /// comfortably under the ~30s window observed before the plotter drops
-  /// the session.
+  /// Indices the real app re-subscribes to every 5s as its keepalive — see
+  /// this file's top doc comment. Order matches the capture exactly, though
+  /// nothing suggests it matters.
+  static const _keepaliveSubscribeIndices = [8, 10, 6];
+
+  /// Replays the real app's own keepalive: re-sending `tSubscribe` for
+  /// [_keepaliveSubscribeIndices] every 5s, for as long as this client is
+  /// connected — see this file's top doc comment for why the plotter needs
+  /// *some* activity on this connection to keep the RTSP video stream
+  /// alive, and why this (rather than a synthetic `tTouch`, tried and
+  /// reverted first) is what to send: being a different frame type
+  /// entirely, it cannot interact with touch/cursor state, so there's no
+  /// equivalent of the double-tap bug that approach caused.
   void _startKeepalive() {
     _keepaliveTimer?.cancel();
     _keepaliveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      final ctx = touchCtx;
-      if (ctx == null) return;
-      _send(tTouch, encodeTouch(ctx, 0.0, 0.0, false));
+      if (touchCtx == null) return;
+      for (final idx in _keepaliveSubscribeIndices) {
+        _send(tSubscribe, _u32le(idx));
+      }
     });
   }
 

@@ -17,20 +17,20 @@
 /// turned out to be unnecessary *and* costly: the freeze's real cause
 /// was never on this connection at all — it was the plotter's separate
 /// touch/control channel (`HelmClient`, port 51200) killing the whole
-/// session, video included, when it stopped seeing touch activity after
-/// the initial context handshake. See `helm_client.dart`'s doc comment for
-/// the full investigation. `HelmClient` now sends a periodic no-op touch
-/// frame once its context is granted, which fixes the freeze at the
-/// source — there is no plotter-side RTSP keepalive requirement beyond
-/// what `fvp`/mdk already does on its own (mdk sends its own RTSP
-/// `OPTIONS` every 30s, same as a plain `ffplay`/FFmpeg client).
+/// session, video included, when it stopped seeing activity after the
+/// initial context handshake. See `helm_client.dart`'s doc comment for
+/// the full investigation. `HelmClient` now sends a periodic keepalive
+/// once its context is granted, which fixes the freeze at the source —
+/// there is no plotter-side RTSP keepalive requirement beyond what
+/// `fvp`/mdk already does on its own (mdk sends its own RTSP `OPTIONS`
+/// every 30s, same as a plain `ffplay`/FFmpeg client).
 ///
 /// With the freeze fixed at its actual source, routing every video byte
 /// through an extra local TCP hop was pure overhead: after wiring the
-/// touch keepalive, the video was stable but control input lagged
-/// noticeably worse than earlier in this project's history, when the
-/// player connected to the plotter directly. Removing the proxy (this
-/// version) restores the direct connection.
+/// keepalive, the video was stable but control input lagged noticeably
+/// worse than earlier in this project's history, when the player
+/// connected to the plotter directly. Removing the proxy (this version)
+/// restores the direct connection.
 ///
 /// `video_player`/`fvp` don't reliably surface a stream drop as
 /// `hasError` — a dead stream just freezes on the last frame (Linux) or
