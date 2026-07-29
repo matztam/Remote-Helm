@@ -123,11 +123,15 @@ dart run bin/helm_cli.dart helm --host <plotter-ip> --tap 0.5 0.5
   0xBEEF][u32 length LE][payload]`), documented and implemented in
   `lib/helm/protocol.dart` and `lib/helm/helm_client.dart`. After the
   initial handshake grants a touch context, the plotter expects ongoing
-  touch activity as a keepalive for the *whole* session — including the
-  separate video stream — so this client sends a periodic inert touch
-  frame once every 5 seconds for as long as it's connected (see
-  `helm_client.dart`'s doc comment for the full story of how that
-  requirement was found).
+  activity as a keepalive for the *whole* session — including the
+  separate video stream — or it kills everything after ~30s. This client
+  replays the same keepalive the real ActiveCaptain app itself uses
+  (confirmed via packet capture): a periodic re-subscribe to a few data
+  indices every 5 seconds, rather than a synthetic touch frame — the
+  latter was tried first and worked, but the plotter tracks touch
+  position across the whole session, so a synthetic frame could make the
+  next real tap silently register at the wrong spot. See
+  `helm_client.dart`'s doc comment for the full story.
 - **Video**: the plotter serves H.264 over RTSP on port 554, UDP transport
   only. `video_player` has no RTSP support on its own, so `fvp` (an
   FFmpeg/mdk-based platform implementation) is registered in its place
