@@ -134,25 +134,20 @@ class HelmVideoView extends StatefulWidget {
   /// Called whenever the underlying player's status changes.
   final ValueChanged<HelmVideoStatus>? onStatusChanged;
 
-  /// Called once the video's aspect ratio is known (after `initialize()`)
-  /// and again if it ever changes. [HelmTouchSurface] needs this to map
-  /// pointer coordinates onto the plotter's screen correctly: this view
-  /// letterboxes the video inside whatever space its parent gives it (see
-  /// `build()` below), so the video's own on-screen rectangle is usually
-  /// smaller than this widget's full bounds — most noticeably right after
-  /// a screen rotation, when the available space's aspect ratio suddenly
-  /// no longer matches the plotter's (fixed, landscape) video. Without
-  /// knowing the actual video rectangle, touch input gets normalized
-  /// against the full (wrong) bounds instead, throwing off both the scale
-  /// and, once the video is no longer centered exactly the same way, the
-  /// offset too.
-  final ValueChanged<double>? onAspectRatioChanged;
+  /// Attached to the `AspectRatio` widget that letterboxes the video (see
+  /// `build()` below) so a wrapping `HelmTouchSurface` can measure that
+  /// widget's actual on-screen rectangle directly, instead of recomputing
+  /// it independently from a separately-tracked aspect ratio number (which
+  /// can drift out of sync with what's actually rendered — see
+  /// `helm_touch_surface.dart`'s top doc comment for a real-device report
+  /// this caused).
+  final GlobalKey videoBoxKey;
 
   const HelmVideoView({
     super.key,
     required this.rtspUrl,
+    required this.videoBoxKey,
     this.onStatusChanged,
-    this.onAspectRatioChanged,
   });
 
   @override
@@ -229,7 +224,6 @@ class HelmVideoViewState extends State<HelmVideoView> {
       await controller.play();
       _controller = controller;
       _setStatus(HelmVideoStatus.playing);
-      widget.onAspectRatioChanged?.call(controller.value.aspectRatio);
       _retryDelay = _minRetryDelay;
       _lastPosition = null;
       _watchdogTimer = Timer.periodic(_watchdogInterval, (_) => _checkForStall());
@@ -297,6 +291,7 @@ class HelmVideoViewState extends State<HelmVideoView> {
     }
     return Center(
       child: AspectRatio(
+        key: widget.videoBoxKey,
         aspectRatio: controller.value.aspectRatio,
         child: VideoPlayer(controller),
       ),

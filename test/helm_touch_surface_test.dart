@@ -3,56 +3,111 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:remote_helm/ui/helm_touch_surface.dart';
 
 void main() {
-  group('videoRect', () {
-    test('with no aspect ratio, returns the full container (pre-letterboxing behavior)', () {
-      const size = Size(800, 400);
-      expect(videoRect(size, null), const Rect.fromLTWH(0, 0, 800, 400));
+  group('measuredVideoRect', () {
+    testWidgets('returns null before the video box has been laid out', (tester) async {
+      final key = GlobalKey();
+      final ancestorKey = GlobalKey();
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(key: ancestorKey, width: 800, height: 600),
+        ),
+      );
+      final ancestorBox = ancestorKey.currentContext!.findRenderObject()! as RenderBox;
+      // `key` was never attached to anything in the pumped tree, matching
+      // the state before HelmVideoView's AspectRatio has been built.
+      expect(measuredVideoRect(key, ancestorBox), isNull);
     });
 
-    test('with a non-positive aspect ratio, returns the full container', () {
-      const size = Size(800, 400);
-      expect(videoRect(size, 0), const Rect.fromLTWH(0, 0, 800, 400));
-      expect(videoRect(size, -1), const Rect.fromLTWH(0, 0, 800, 400));
+    testWidgets('measures the exact rect of a same-size child', (tester) async {
+      final videoKey = GlobalKey();
+      final ancestorKey = GlobalKey();
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox(
+            key: ancestorKey,
+            width: 800,
+            height: 600,
+            child: SizedBox(key: videoKey, width: 800, height: 600),
+          ),
+        ),
+      );
+      final ancestorBox = ancestorKey.currentContext!.findRenderObject()! as RenderBox;
+      final rect = measuredVideoRect(videoKey, ancestorBox);
+      expect(rect, const Rect.fromLTWH(0, 0, 800, 600));
     });
 
-    test('when container and video aspect ratios match, fills the container exactly', () {
-      // 16:9 container, 16:9 video.
-      const size = Size(1600, 900);
-      final rect = videoRect(size, 16 / 9);
-      expect(rect, const Rect.fromLTWH(0, 0, 1600, 900));
-    });
+    testWidgets(
+      'portrait window with a landscape video: measures the letterboxed rect actually rendered',
+      (tester) async {
+        // Reproduces the reported bug scenario directly: a tablet in
+        // portrait (narrower than tall) showing the plotter's fixed 16:9
+        // landscape video via Center+AspectRatio, exactly like
+        // HelmVideoView renders it. Measuring the real AspectRatio render
+        // box (rather than recomputing its layout from a tracked
+        // aspectRatio number) means this is the same rect the video is
+        // actually drawn at, by construction — no way for the two to
+        // diverge.
+        tester.view.physicalSize = const Size(720, 1280);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
 
-    test('portrait window with a landscape video: letterboxed top/bottom, centered', () {
-      // A tablet rotated to portrait (narrower than tall), showing the
-      // plotter's fixed 16:9 landscape video — this is the case that
-      // broke before videoRect existed: the video is width-constrained
-      // and much shorter than the full container height.
-      const size = Size(720, 1280);
-      final rect = videoRect(size, 16 / 9);
+        final videoKey = GlobalKey();
+        final ancestorKey = GlobalKey();
+        await tester.pumpWidget(
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: SizedBox.expand(
+              key: ancestorKey,
+              child: Center(
+                child: AspectRatio(
+                  key: videoKey,
+                  aspectRatio: 16 / 9,
+                  child: const SizedBox.expand(),
+                ),
+              ),
+            ),
+          ),
+        );
+        final ancestorBox = ancestorKey.currentContext!.findRenderObject()! as RenderBox;
+        final rect = measuredVideoRect(videoKey, ancestorBox)!;
 
-      expect(rect.width, 720);
-      expect(rect.height, closeTo(405, 0.01)); // 720 / (16/9)
-      expect(rect.left, 0);
-      expect(rect.top, closeTo((1280 - 405) / 2, 0.01));
-    });
+        expect(rect.width, 720);
+        expect(rect.height, closeTo(405, 0.01)); // 720 / (16/9)
+        expect(rect.left, 0);
+        expect(rect.top, closeTo((1280 - 405) / 2, 0.01));
+      },
+    );
 
-    test('landscape window much wider than a landscape video: letterboxed left/right, centered', () {
-      const size = Size(2000, 900);
-      final rect = videoRect(size, 16 / 9);
+    testWidgets('a tap at the video rectangle\'s exact corners normalizes to (0,0) and (1,1)', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(720, 1280);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
-      expect(rect.height, 900);
-      expect(rect.width, closeTo(1600, 0.01)); // 900 * (16/9)
-      expect(rect.top, 0);
-      expect(rect.left, closeTo((2000 - 1600) / 2, 0.01));
-    });
-
-    test('a tap at the video rectangle\'s exact corners normalizes to (0,0) and (1,1)', () {
-      // Regression check for the actual bug report: after a rotation, taps
-      // at the visible edges of the (now letterboxed) video must still map
-      // to the plotter's own screen edges, not to the edges of the full
-      // (larger) container.
-      const size = Size(720, 1280);
-      final rect = videoRect(size, 16 / 9);
+      final videoKey = GlobalKey();
+      final ancestorKey = GlobalKey();
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: SizedBox.expand(
+            key: ancestorKey,
+            child: Center(
+              child: AspectRatio(
+                key: videoKey,
+                aspectRatio: 16 / 9,
+                child: const SizedBox.expand(),
+              ),
+            ),
+          ),
+        ),
+      );
+      final ancestorBox = ancestorKey.currentContext!.findRenderObject()! as RenderBox;
+      final rect = measuredVideoRect(videoKey, ancestorBox)!;
 
       Offset normalize(Offset local) {
         final x = ((local.dx - rect.left) / rect.width).clamp(0.0, 1.0);

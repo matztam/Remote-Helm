@@ -25,13 +25,11 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> {
   bool _controlsVisible = true; // desktop: always effectively true (shown)
   bool _isFullscreen = false;
 
-  // Kept in sync with HelmVideoView's actual aspect ratio so
-  // HelmTouchSurface can map pointer coordinates onto the video's real
-  // (letterboxed) rectangle instead of its full container — otherwise a
-  // screen rotation that changes the container's aspect ratio without
-  // changing the plotter's (fixed) video aspect ratio throws off touch
-  // input until the app is restarted.
-  double? _videoAspectRatio;
+  // Attached to HelmVideoView's AspectRatio widget so HelmTouchSurface can
+  // measure its actual on-screen rectangle directly, instead of recomputing
+  // it from a separately-tracked aspect ratio value that could drift out of
+  // sync with what's actually rendered.
+  final _videoBoxKey = GlobalKey();
 
   @override
   void initState() {
@@ -127,16 +125,11 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> {
         ? const Center(
             child: Text('Not connected.', style: TextStyle(color: Colors.white70)),
           )
-        : HelmVideoView(
-            rtspUrl: rtspUrl,
-            onAspectRatioChanged: (ratio) {
-              if (mounted) setState(() => _videoAspectRatio = ratio);
-            },
-          );
+        : HelmVideoView(rtspUrl: rtspUrl, videoBoxKey: _videoBoxKey);
 
     final withTouch = HelmTouchSurface(
       client: client,
-      videoAspectRatio: _videoAspectRatio,
+      videoBoxKey: _videoBoxKey,
       child: video,
     );
 

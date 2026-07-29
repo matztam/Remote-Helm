@@ -15,6 +15,29 @@
 ///    (including trackpad "smooth" scroll, which Flutter normalizes into
 ///    the same PointerScrollEvent) = zoom, synthesized as a two-finger pinch
 ///    like the Python reference's HelmClient.zoom().
+///
+/// ## Locating the video's own rectangle
+///
+/// This used to be computed indirectly: `HelmVideoView` reported its
+/// player's `aspectRatio` as a plain `double` via a callback, and this
+/// widget re-derived the letterboxed rectangle from that number using the
+/// same "contain fit" math `AspectRatio` itself uses (see the old
+/// `videoRect(Size, double?)` helper). That's a second, independent
+/// implementation of the same layout decision `AspectRatio` already made —
+/// any mismatch between the two (e.g. the reported `aspectRatio` being
+/// stale, `0`, or otherwise not what was actually rendered) makes this
+/// widget's rectangle silently diverge from the one on screen, with no
+/// visible sign beyond touch input landing in the wrong place. That's
+/// consistent with a real-device report (Pixel 9 Pro, portrait) where
+/// vertical touch input collapsed to a narrow band around the video's
+/// center — exactly what happens when the rect used for normalization is
+/// taller than the one actually drawn (see `helm_touch_surface_test.dart`).
+///
+/// Instead, [videoBoxKey] must be attached to the actual widget being
+/// rendered at the video's own size (e.g. the `AspectRatio` in
+/// `HelmVideoView`) — its [RenderBox] is measured directly, every time a
+/// pointer event needs normalizing, so there is no second calculation to
+/// drift out of sync with what's on screen.
 library;
 
 import 'dart:async';
@@ -24,62 +47,35 @@ import 'package:flutter/widgets.dart';
 
 import '../helm/helm_client.dart';
 
-/// The video's own on-screen rectangle within [size] given its
-/// [aspectRatio] (width / height) — the full [size] when [aspectRatio] is
-/// `null` or otherwise not usable, matching `HelmTouchSurface`'s behavior
-/// before it was aware of letterboxing (only correct when the container's
-/// and the video's aspect ratios happen to match). Otherwise, this is the
-/// centered rectangle `Center(child: AspectRatio(aspectRatio: ...))` would
-/// actually render: fit [aspectRatio] inside [size] without cropping, then
-/// center it — the same "contain" fit `AspectRatio` itself computes.
-///
-/// A top-level function (rather than a method) so it can be unit-tested
-/// directly, without needing to pump a widget tree.
-Rect videoRect(Size size, double? aspectRatio) {
-  if (aspectRatio == null || aspectRatio <= 0 || size.width <= 0 || size.height <= 0) {
-    return Offset.zero & size;
+/// The video's own on-screen rectangle, in this [ancestor]'s local
+/// coordinate space, as actually rendered by the widget attached to
+/// [videoBoxKey] — or `null` if that widget hasn't been laid out yet (e.g.
+/// the very first frame) or [ancestor] isn't one of its ancestors.
+Rect? measuredVideoRect(GlobalKey videoBoxKey, RenderBox ancestor) {
+  final videoBox = videoBoxKey.currentContext?.findRenderObject();
+  if (videoBox is! RenderBox || !videoBox.attached || !videoBox.hasSize) {
+    return null;
   }
-  final containerRatio = size.width / size.height;
-  late Size videoSize;
-  if (containerRatio > aspectRatio) {
-    // Container is relatively wider than the video: video is
-    // height-constrained, letterboxed left/right.
-    videoSize = Size(size.height * aspectRatio, size.height);
-  } else {
-    // Container is relatively taller (or equal): video is
-    // width-constrained, letterboxed top/bottom.
-    videoSize = Size(size.width, size.width / aspectRatio);
-  }
-  final offset = Offset(
-    (size.width - videoSize.width) / 2,
-    (size.height - videoSize.height) / 2,
-  );
-  return offset & videoSize;
+  final topLeft = videoBox.localToGlobal(Offset.zero, ancestor: ancestor);
+  return topLeft & videoBox.size;
 }
 
 class HelmTouchSurface extends StatefulWidget {
   final HelmClient? client;
   final Widget child;
 
-  /// The plotter video's own aspect ratio (width / height), if known. The
-  /// child is expected to letterbox the video to fit inside whatever space
-  /// it's given (see `HelmVideoView`) — this widget needs to know the
-  /// video's *own* rectangle within that space to normalize pointer
-  /// coordinates correctly, since the space given to the child (this
-  /// widget's own [LayoutBuilder] constraints) is usually larger than the
-  /// actual letterboxed video once their aspect ratios don't match (e.g.
-  /// right after a screen rotation, when the plotter's fixed landscape
-  /// video no longer matches the new window/screen shape). `null` (the
-  /// default) falls back to treating the full available space as the
-  /// video's own area, which is only correct when the aspect ratios
-  /// happen to match.
-  final double? videoAspectRatio;
+  /// Attached by the caller to the actual widget rendered at the video's own
+  /// (letterboxed) size and position — e.g. the `AspectRatio` in
+  /// `HelmVideoView` — so this widget can measure its real on-screen
+  /// rectangle directly instead of recomputing it from a separately-tracked
+  /// aspect ratio. See this file's top doc comment for why.
+  final GlobalKey videoBoxKey;
 
   const HelmTouchSurface({
     super.key,
     required this.client,
     required this.child,
-    this.videoAspectRatio,
+    required this.videoBoxKey,
   });
 
   @override
@@ -100,18 +96,18 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
   // and the UI would appear to lag/freeze behind a growing backlog.
   bool _zoomBusy = false;
 
-  Offset? _normalize(Size size, Offset local) {
-    final rect = videoRect(size, widget.videoAspectRatio);
-    if (rect.width <= 0 || rect.height <= 0) return null;
+  Offset? _normalize(RenderBox ancestor, Offset local) {
+    final rect = measuredVideoRect(widget.videoBoxKey, ancestor);
+    if (rect == null || rect.width <= 0 || rect.height <= 0) return null;
     final x = ((local.dx - rect.left) / rect.width).clamp(0.0, 1.0);
     final y = ((local.dy - rect.top) / rect.height).clamp(0.0, 1.0);
     return Offset(x, y);
   }
 
-  void _onPointerDown(PointerDownEvent event, Size size) {
+  void _onPointerDown(PointerDownEvent event, RenderBox box) {
     final client = widget.client;
     if (client == null || !client.canZoom) return;
-    final norm = _normalize(size, event.localPosition);
+    final norm = _normalize(box, event.localPosition);
     if (norm == null) return;
 
     _activePointerOrder.add(event.pointer);
@@ -126,11 +122,11 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
     // (only two track_ids are used); ignore extras rather than error.
   }
 
-  void _onPointerMove(PointerMoveEvent event, Size size) {
+  void _onPointerMove(PointerMoveEvent event, RenderBox box) {
     final client = widget.client;
     if (client == null || !client.canZoom) return;
     if (!_activePointerOrder.contains(event.pointer)) return;
-    final norm = _normalize(size, event.localPosition);
+    final norm = _normalize(box, event.localPosition);
     if (norm == null) return;
     _pointerPositions[event.pointer] = norm;
 
@@ -141,11 +137,10 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
     }
   }
 
-  void _onPointerUp(PointerEvent event, Size size) {
+  void _onPointerUp(PointerEvent event, RenderBox box) {
     final client = widget.client;
     final wasTwoFingers = _activePointerOrder.length >= 2;
-    final norm = _pointerPositions[event.pointer] ??
-        (size.width > 0 && size.height > 0 ? _normalize(size, event.localPosition) : null);
+    final norm = _pointerPositions[event.pointer] ?? _normalize(box, event.localPosition);
 
     _activePointerOrder.remove(event.pointer);
     _pointerPositions.remove(event.pointer);
@@ -180,10 +175,10 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
     client.sendPinchFrame(p0.dx, p0.dy, p1.dx, p1.dy, down);
   }
 
-  void _onScroll(PointerScrollEvent event, Size size) {
+  void _onScroll(PointerScrollEvent event, RenderBox box) {
     final client = widget.client;
     if (client == null || !client.canZoom || _zoomBusy) return;
-    final norm = _normalize(size, event.localPosition);
+    final norm = _normalize(box, event.localPosition);
     if (norm == null) return;
     final direction = event.scrollDelta.dy < 0 ? 1 : -1;
 
@@ -193,23 +188,36 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
     );
   }
 
+  final _listenerKey = GlobalKey();
+
+  RenderBox? get _box => _listenerKey.currentContext?.findRenderObject() as RenderBox?;
+
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final size = Size(constraints.maxWidth, constraints.maxHeight);
-        return Listener(
-          behavior: HitTestBehavior.opaque,
-          onPointerDown: (e) => _onPointerDown(e, size),
-          onPointerMove: (e) => _onPointerMove(e, size),
-          onPointerUp: (e) => _onPointerUp(e, size),
-          onPointerCancel: (e) => _onPointerUp(e, size),
-          onPointerSignal: (e) {
-            if (e is PointerScrollEvent) _onScroll(e, size);
-          },
-          child: widget.child,
-        );
+    return Listener(
+      key: _listenerKey,
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (e) {
+        final box = _box;
+        if (box != null) _onPointerDown(e, box);
       },
+      onPointerMove: (e) {
+        final box = _box;
+        if (box != null) _onPointerMove(e, box);
+      },
+      onPointerUp: (e) {
+        final box = _box;
+        if (box != null) _onPointerUp(e, box);
+      },
+      onPointerCancel: (e) {
+        final box = _box;
+        if (box != null) _onPointerUp(e, box);
+      },
+      onPointerSignal: (e) {
+        final box = _box;
+        if (e is PointerScrollEvent && box != null) _onScroll(e, box);
+      },
+      child: widget.child,
     );
   }
 }
