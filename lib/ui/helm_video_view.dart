@@ -102,7 +102,26 @@ class HelmVideoView extends StatefulWidget {
   /// Called whenever the underlying player's status changes.
   final ValueChanged<HelmVideoStatus>? onStatusChanged;
 
-  const HelmVideoView({super.key, required this.rtspUrl, this.onStatusChanged});
+  /// Called once the video's aspect ratio is known (after `initialize()`)
+  /// and again if it ever changes. [HelmTouchSurface] needs this to map
+  /// pointer coordinates onto the plotter's screen correctly: this view
+  /// letterboxes the video inside whatever space its parent gives it (see
+  /// `build()` below), so the video's own on-screen rectangle is usually
+  /// smaller than this widget's full bounds — most noticeably right after
+  /// a screen rotation, when the available space's aspect ratio suddenly
+  /// no longer matches the plotter's (fixed, landscape) video. Without
+  /// knowing the actual video rectangle, touch input gets normalized
+  /// against the full (wrong) bounds instead, throwing off both the scale
+  /// and, once the video is no longer centered exactly the same way, the
+  /// offset too.
+  final ValueChanged<double>? onAspectRatioChanged;
+
+  const HelmVideoView({
+    super.key,
+    required this.rtspUrl,
+    this.onStatusChanged,
+    this.onAspectRatioChanged,
+  });
 
   @override
   State<HelmVideoView> createState() => HelmVideoViewState();
@@ -158,6 +177,7 @@ class HelmVideoViewState extends State<HelmVideoView> {
       await controller.play();
       _controller = controller;
       _setStatus(HelmVideoStatus.playing);
+      widget.onAspectRatioChanged?.call(controller.value.aspectRatio);
     } catch (e, st) {
       // ignore: avoid_print
       print('HelmVideoView: failed to initialize $url: $e\n$st');

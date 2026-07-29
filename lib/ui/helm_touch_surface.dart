@@ -24,11 +24,63 @@ import 'package:flutter/widgets.dart';
 
 import '../helm/helm_client.dart';
 
+/// The video's own on-screen rectangle within [size] given its
+/// [aspectRatio] (width / height) — the full [size] when [aspectRatio] is
+/// `null` or otherwise not usable, matching `HelmTouchSurface`'s behavior
+/// before it was aware of letterboxing (only correct when the container's
+/// and the video's aspect ratios happen to match). Otherwise, this is the
+/// centered rectangle `Center(child: AspectRatio(aspectRatio: ...))` would
+/// actually render: fit [aspectRatio] inside [size] without cropping, then
+/// center it — the same "contain" fit `AspectRatio` itself computes.
+///
+/// A top-level function (rather than a method) so it can be unit-tested
+/// directly, without needing to pump a widget tree.
+Rect videoRect(Size size, double? aspectRatio) {
+  if (aspectRatio == null || aspectRatio <= 0 || size.width <= 0 || size.height <= 0) {
+    return Offset.zero & size;
+  }
+  final containerRatio = size.width / size.height;
+  late Size videoSize;
+  if (containerRatio > aspectRatio) {
+    // Container is relatively wider than the video: video is
+    // height-constrained, letterboxed left/right.
+    videoSize = Size(size.height * aspectRatio, size.height);
+  } else {
+    // Container is relatively taller (or equal): video is
+    // width-constrained, letterboxed top/bottom.
+    videoSize = Size(size.width, size.width / aspectRatio);
+  }
+  final offset = Offset(
+    (size.width - videoSize.width) / 2,
+    (size.height - videoSize.height) / 2,
+  );
+  return offset & videoSize;
+}
+
 class HelmTouchSurface extends StatefulWidget {
   final HelmClient? client;
   final Widget child;
 
-  const HelmTouchSurface({super.key, required this.client, required this.child});
+  /// The plotter video's own aspect ratio (width / height), if known. The
+  /// child is expected to letterbox the video to fit inside whatever space
+  /// it's given (see `HelmVideoView`) — this widget needs to know the
+  /// video's *own* rectangle within that space to normalize pointer
+  /// coordinates correctly, since the space given to the child (this
+  /// widget's own [LayoutBuilder] constraints) is usually larger than the
+  /// actual letterboxed video once their aspect ratios don't match (e.g.
+  /// right after a screen rotation, when the plotter's fixed landscape
+  /// video no longer matches the new window/screen shape). `null` (the
+  /// default) falls back to treating the full available space as the
+  /// video's own area, which is only correct when the aspect ratios
+  /// happen to match.
+  final double? videoAspectRatio;
+
+  const HelmTouchSurface({
+    super.key,
+    required this.client,
+    required this.child,
+    this.videoAspectRatio,
+  });
 
   @override
   State<HelmTouchSurface> createState() => _HelmTouchSurfaceState();
@@ -49,9 +101,10 @@ class _HelmTouchSurfaceState extends State<HelmTouchSurface> {
   bool _zoomBusy = false;
 
   Offset? _normalize(Size size, Offset local) {
-    if (size.width <= 0 || size.height <= 0) return null;
-    final x = (local.dx / size.width).clamp(0.0, 1.0);
-    final y = (local.dy / size.height).clamp(0.0, 1.0);
+    final rect = videoRect(size, widget.videoAspectRatio);
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    final x = ((local.dx - rect.left) / rect.width).clamp(0.0, 1.0);
+    final y = ((local.dy - rect.top) / rect.height).clamp(0.0, 1.0);
     return Offset(x, y);
   }
 
