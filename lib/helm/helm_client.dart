@@ -8,14 +8,20 @@
 /// pairing flow) and the plotter's global App-permission must be set to
 /// "View and Control".
 ///
-/// Note: like the Python reference, this client only reads from the socket
-/// during the handshake (waiting for `0x1645`). Once connected, sends
-/// (touch/zoom) are one-way; nothing continuously drains further server
-/// frames afterwards. That matches actual usage (video comes separately over
-/// RTSP), but means the socket's receive buffer will simply accumulate
-/// unread bytes for the life of the connection if the plotter keeps sending
-/// unsolicited frames — acceptable for a session that's normally closed
-/// within minutes to hours, not indefinitely long-lived.
+/// Note: unlike the Python reference, this client keeps its socket
+/// subscription alive past the handshake (see `_awaitContext`) — it just
+/// stops parsing what arrives and discards it. sends (touch/zoom) are
+/// otherwise one-way; nothing does anything with further server frames'
+/// *content*. This was a plain no-op subscription cancel originally
+/// (matching the Python reference, which never reads again either), but a
+/// real-device report on Windows showed touch input silently stopping a
+/// few seconds after connecting — right around when the keepalive (below)
+/// starts making the plotter send small unsolicited replies this client
+/// was never draining. Reproduced and fixed by keeping the socket read
+/// side open (discarding, not parsing, everything after the handshake)
+/// instead of dropping it — the same build had no such issue on Linux or
+/// Android, where an unread receive buffer apparently doesn't block
+/// subsequent writes the way it does on Windows.
 ///
 /// ## Why this client sends a periodic re-subscribe as a keepalive
 ///
@@ -195,8 +201,18 @@ class HelmClient {
     deadline = Timer(timeout, () => finish(null));
     final result = await completer.future;
     deadline.cancel();
-    await _rxSub?.cancel();
-    _rxSub = null;
+    if (result != null) {
+      // Keep the subscription alive (see this file's top doc comment for
+      // why) but stop doing anything with what it delivers — a socket is
+      // single-subscription, so a later listen() after cancel() would
+      // throw; swapping the callbacks is how to make it a no-op instead.
+      _rxSub?.onData((_) {});
+      _rxSub?.onError((_) {});
+      _rxSub?.onDone(() {});
+    } else {
+      await _rxSub?.cancel();
+      _rxSub = null;
+    }
     return result;
   }
 

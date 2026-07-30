@@ -17,6 +17,14 @@ run-name: Build (Linux/Windows/Android)
 # artifact expiry. The plain `remote_helm-<platform>` artifacts are skipped
 # on tag pushes, since they'd just be an unzipped duplicate of what's
 # already attached to the Release.
+#
+# On a tag push, the version baked into each build (Windows/Linux file
+# properties, the Android APK's versionName/versionCode) is derived from
+# the tag itself via --build-name/--build-number, not pubspec.yaml's own
+# `version:` — that field is otherwise easy to forget to bump and drifts
+# out of sync with the actual tagged release. An ordinary push (no tag)
+# just uses whatever pubspec.yaml says, same as running `flutter build`
+# locally.
 on:
   push:
   workflow_dispatch:
@@ -25,7 +33,23 @@ permissions:
   contents: write # needed by the release job to create/attach to a GitHub Release
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      flutter-version-args: ${{ steps.version.outputs.args }}
+    steps:
+      - name: Derive --build-name/--build-number from the tag, if any
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="${GITHUB_REF#refs/tags/v}"
+            echo "args=--build-name=$name --build-number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
   build-linux:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +68,7 @@ jobs:
         run: flutter pub get
 
       - name: flutter build linux
-        run: flutter build linux --release
+        run: flutter build linux --release ${{ needs.version.outputs.flutter-version-args }}
 
       - uses: actions/upload-artifact@v4
         if: "!startsWith(github.ref, 'refs/tags/')"
@@ -67,6 +91,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +105,7 @@ jobs:
         run: flutter pub get
 
       - name: flutter build windows
-        run: flutter build windows --release
+        run: flutter build windows --release ${{ needs.version.outputs.flutter-version-args }}
 
       - uses: actions/upload-artifact@v4
         if: "!startsWith(github.ref, 'refs/tags/')"
@@ -101,6 +126,7 @@ jobs:
           if-no-files-found: error
 
   build-android:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +145,7 @@ jobs:
         run: flutter pub get
 
       - name: flutter build apk
-        run: flutter build apk --release
+        run: flutter build apk --release ${{ needs.version.outputs.flutter-version-args }}
 
       - uses: actions/upload-artifact@v4
         if: "!startsWith(github.ref, 'refs/tags/')"
