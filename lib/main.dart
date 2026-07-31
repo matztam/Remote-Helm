@@ -23,7 +23,7 @@ class RemoteHelmApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'remote_helm',
+      title: 'Remote Helm',
       theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey)),
       darkTheme: ThemeData.dark(),
       home: const HelmHomeScreen(),

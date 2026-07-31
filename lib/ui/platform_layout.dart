@@ -25,12 +25,18 @@ Future<void> initializePlatformLayout() async {
       size: Size(1100, 700),
       minimumSize: Size(480, 320),
       center: true,
-      title: 'remote_helm',
+      title: 'Remote Helm',
     );
     await windowManager.waitUntilReadyToShow(options, () async {
       await windowManager.show();
       await windowManager.focus();
     });
+    // Windows gets its window/taskbar icon from the compiled .ico resource
+    // (see windows/runner/resources/app_icon.ico) automatically; only
+    // Linux (GTK) needs it set explicitly at runtime like this.
+    if (Platform.isLinux) {
+      await windowManager.setIcon('assets/icon/app_icon.png');
+    }
   } else if (Platform.isAndroid) {
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     // Landscape isn't forced (the plotter's video works either way with

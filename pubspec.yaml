@@ -83,6 +83,11 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+  # Generates platform launcher icons from assets/icon/ (`dart run
+  # flutter_launcher_icons`) — see the `flutter_launcher_icons:` config
+  # below for what it targets.
+  flutter_launcher_icons: ^0.14.4
+
 # fvp pulls in jni_flutter -> jni transitively. jni 1.0.1 (fvp's resolved
 # version at the time this was written) unconditionally uses a Gradle
 # `kotlin { ... }` DSL block that only exists if the kotlin-android plugin
@@ -104,10 +109,12 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  # app_icon.png is bundled as a regular asset (in addition to being the
+  # source flutter_launcher_icons generates the Android/Windows launcher
+  # icons from) because Linux sets its window icon at runtime from it
+  # (see platform_layout.dart) rather than embedding it at build time.
+  assets:
+    - assets/icon/app_icon.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
@@ -134,3 +141,15 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+# Run `dart run flutter_launcher_icons` after changing anything here or the
+# source images in assets/icon/ to regenerate the platform icon files —
+# this config doesn't do anything on its own at build time.
+flutter_launcher_icons:
+  android: true
+  image_path: assets/icon/app_icon.png
+  adaptive_icon_background: "#0a1f3d"
+  adaptive_icon_foreground: assets/icon/app_icon_foreground.png
+  windows:
+    generate: true
+    image_path: assets/icon/app_icon.png
