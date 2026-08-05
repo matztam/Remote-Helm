@@ -72,6 +72,21 @@ dependencies:
   # app's own lifecycle (see ui/helm_home_screen.dart), not held globally.
   wakelock_plus: ^1.3.2
 
+  # Parses GPX files for route import (see helm/gpx.dart) — a real XML
+  # parser rather than regex/string-splitting, since GPX is arbitrary XML
+  # (namespaces, varying attribute/element order, extensions).
+  xml: ^6.6.1
+
+  # Lets the user pick a .gpx file to import from the platform's own file
+  # picker, on every supported platform (Android/Windows/Linux). Tried
+  # file_picker first, but its Android module is fixed at compileSdk 34
+  # while its own transitive flutter_plugin_android_lifecycle dependency
+  # requires 36+ (a conflict entirely inside file_picker's own dependency
+  # tree — no combination of pinning/overriding fixed it). file_selector
+  # is the officially Flutter-team-maintained equivalent and doesn't have
+  # this issue.
+  file_selector: ^1.0.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

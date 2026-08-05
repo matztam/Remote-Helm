@@ -5,10 +5,13 @@ library;
 
 import 'dart:async';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../helm/discovery.dart';
+import '../helm/gpx.dart';
+import '../helm/route_sync.dart';
 import 'helm_session_controller.dart';
 import 'helm_touch_surface.dart';
 import 'helm_video_view.dart';
@@ -287,6 +290,12 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
               onPressed: _onConnectPressed,
               child: Text(_session.isConnected ? 'Disconnect' : 'Connect'),
             ),
+            if (_session.isConnected)
+              IconButton(
+                tooltip: 'Import GPX route',
+                icon: const Icon(Icons.route),
+                onPressed: _onImportGpxPressed,
+              ),
             if (isDesktopPlatform) ...[
               const Spacer(),
               IconButton(
@@ -353,5 +362,74 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     final host = _hostController.text.trim();
     if (host.isEmpty) return;
     await _session.connect(host);
+  }
+
+  /// Picks a `.gpx` file, extracts its routes ([parseGpxRoutes]), and
+  /// syncs the first one straight to the plotter ([syncRoute]) — or, if
+  /// the file has more than one `<rte>`, lets the user choose which,
+  /// mirroring the plotter-selection flow in [_onDiscoverPressed].
+  ///
+  /// [syncRoute]'s wire format only supports exactly 4-point routes so
+  /// far (see route_sync.dart's doc comment on the reverse-engineering
+  /// gap this leaves) — a route with any other point count is reported
+  /// as an error here rather than silently failing partway through.
+  Future<void> _onImportGpxPressed() async {
+    const gpxType = XTypeGroup(label: 'GPX', extensions: ['gpx']);
+    final file = await openFile(acceptedTypeGroups: const [gpxType]);
+    if (file == null) return;
+    final gpxText = await file.readAsString();
+
+    List<GpxRoute> routes;
+    try {
+      routes = parseGpxRoutes(gpxText);
+    } on GpxParseException catch (e) {
+      _showSnack('Could not read that GPX file: $e');
+      return;
+    }
+    if (routes.isEmpty) {
+      _showSnack('No routes found in that GPX file.');
+      return;
+    }
+
+    GpxRoute? chosen = routes.first;
+    if (routes.length > 1) {
+      if (!mounted) return;
+      chosen = await showDialog<GpxRoute>(
+        context: context,
+        builder: (context) => SimpleDialog(
+          title: const Text('Select a route to import'),
+          children: [
+            for (final r in routes)
+              SimpleDialogOption(
+                onPressed: () => Navigator.of(context).pop(r),
+                child: Text('${r.name} (${r.points.length} points)'),
+              ),
+          ],
+        ),
+      );
+    }
+    if (chosen == null) return;
+
+    final host = _session.lastHost;
+    if (host == null || host.isEmpty) return;
+
+    try {
+      await syncRoute(host, chosen.name, chosen.points);
+      _showSnack('Sent "${chosen.name}" to the plotter.');
+    } on UnimplementedError {
+      _showSnack(
+        '"${chosen.name}" has ${chosen.points.length} points — only routes with '
+        'exactly 4 points can be sent right now (see route_sync.dart).',
+      );
+    } on RouteSyncTimeoutException catch (e) {
+      _showSnack('Plotter did not respond: $e');
+    } on Object catch (e) {
+      _showSnack('Failed to send route: $e');
+    }
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 }

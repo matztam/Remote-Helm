@@ -51,6 +51,10 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   other windows at a nav station.
 - **Screen stays on** while the app is running (wakelock), since a screen
   timing out mid-use at the helm would defeat the point.
+- **GPX route import**: pushes a route straight from a `.gpx` file to the
+  plotter over its own sync channel — no SD card, no cloud round-trip.
+  Currently limited to routes with exactly 4 points (see
+  `lib/helm/route_sync.dart`'s doc comment for why).
 
 ## Requirements
 
@@ -142,9 +146,19 @@ dart run bin/helm_cli.dart helm --host <plotter-ip> --tap 0.5 0.5
   only. `video_player` has no RTSP support on its own, so `fvp` (an
   FFmpeg/mdk-based platform implementation) is registered in its place
   (`lib/ui/helm_video_view.dart`).
+- **Route sync**: a separate TCP connection (port 50610, same framing as
+  the touch/control session) that pushes route/waypoint data to the
+  plotter. This channel has no prior public documentation anywhere — it
+  was reverse-engineered from a packet capture of the real ActiveCaptain
+  app doing a route sync, since neither `helm-linux`'s own protocol notes
+  nor any other source covers it. See `lib/helm/route_sync.dart`'s doc
+  comment for the full wire format and, importantly, its known gaps (it's
+  only confirmed to work for exactly 4-point routes so far). GPX parsing
+  itself is in `lib/helm/gpx.dart`.
 
-For the full wire format this is all built on — exact frame layouts, the
-pairing protobuf, touch/pinch byte encoding — see `helm-linux`'s
+For the full wire format everything above (except route sync) is built
+on — exact frame layouts, the pairing protobuf, touch/pinch byte encoding
+— see `helm-linux`'s
 [PROTOCOL.md](https://github.com/Mrkvak/helm-linux/blob/master/PROTOCOL.md).
 
 ## License
