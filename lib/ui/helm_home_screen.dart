@@ -46,6 +46,14 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   // Long enough to comfortably clear normal quick-switch UI interactions.
   static const _resumeReconnectThreshold = Duration(seconds: 10);
 
+  // On Android, the controls auto-hide again a bit after a connection
+  // succeeds — e.g. after the user reveals them to type in a plotter IP
+  // manually — so the video goes back to filling the whole screen without
+  // a second manual tap. Tracked so a rapid connect/disconnect/reconnect
+  // sequence doesn't leave more than one of these timers running at once.
+  Timer? _autoHideTimer;
+  static const _autoHideDelay = Duration(seconds: 3);
+
   @override
   void initState() {
     super.initState();
@@ -148,12 +156,27 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   String _addressOf(HelmServiceInfo s) => s.address.isEmpty ? s.host : s.address;
 
   void _onSessionChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    // On Android, once a connection succeeds, the controls (if visible —
+    // e.g. the user just typed in a plotter IP by hand) should get out of
+    // the way again on their own, same as they were before the user had to
+    // reveal them at all. Desktop always shows them, so this is a no-op
+    // there; _hideControls itself is also an Android-only no-op guard away
+    // from mattering, but skipping the timer entirely there avoids an
+    // untriggered Timer sitting around for no reason.
+    if (!isDesktopPlatform && _session.isConnected && _controlsVisible) {
+      _autoHideTimer?.cancel();
+      _autoHideTimer = Timer(_autoHideDelay, () {
+        if (mounted && _session.isConnected) _hideControls();
+      });
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _autoHideTimer?.cancel();
     WakelockPlus.disable();
     _session.removeListener(_onSessionChanged);
     _session.dispose();
@@ -167,6 +190,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   }
 
   Future<void> _revealControls() async {
+    _autoHideTimer?.cancel();
     if (!isDesktopPlatform) await revealAndroidSystemUiTemporarily();
     setState(() => _controlsVisible = true);
   }
