@@ -1,0 +1,182 @@
+name: Build
+run-name: Build (Linux/Windows/Android)
+
+# Runs on every push and can also be triggered manually from the Actions
+# tab. Builds all three supported platforms. Windows and Linux desktop
+# builds can't be cross-compiled from one host, so each platform gets its
+# own appropriately-hosted runner.
+#
+# Ordinary pushes upload each platform's raw build as a downloadable
+# workflow artifact (`remote_helm-<platform>`) — handy for grabbing the
+# latest master build without waiting for a tagged release.
+#
+# Pushing a tag matching v* (e.g. `git tag v1.0.0 && git push --tags`)
+# instead packages each platform's build into a zip (`release-<platform>`)
+# and publishes them on a GitHub Release for that tag — a stable,
+# permanent download location with no login required and no 90-day
+# artifact expiry. The plain `remote_helm-<platform>` artifacts are skipped
+# on tag pushes, since they'd just be an unzipped duplicate of what's
+# already attached to the Release.
+#
+# On a tag push, the version baked into each build (Windows/Linux file
+# properties, the Android APK's versionName/versionCode) is derived from
+# the tag itself via --build-name/--build-number, not pubspec.yaml's own
+# `version:` — that field is otherwise easy to forget to bump and drifts
+# out of sync with the actual tagged release. An ordinary push (no tag)
+# just uses whatever pubspec.yaml says, same as running `flutter build`
+# locally.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed by the release job to create/attach to a GitHub Release
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      flutter-version-args: ${{ steps.version.outputs.args }}
+    steps:
+      - name: Derive --build-name/--build-number from the tag, if any
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="${GITHUB_REF#refs/tags/v}"
+            echo "args=--build-name=$name --build-number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.8
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build linux
+        run: flutter build linux --release ${{ needs.version.outputs.flutter-version-args }}
+
+      - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: remote_helm-linux
+          path: build/linux/x64/release/bundle/
+          if-no-files-found: error
+
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd build/linux/x64/release/bundle
+          zip -r "$GITHUB_WORKSPACE/remote_helm-linux.zip" .
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-linux
+          path: remote_helm-linux.zip
+          if-no-files-found: error
+
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.8
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build windows
+        run: flutter build windows --release ${{ needs.version.outputs.flutter-version-args }}
+
+      - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: remote_helm-windows
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
+
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath remote_helm-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-windows
+          path: remote_helm-windows.zip
+          if-no-files-found: error
+
+  build-android:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.8
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build apk
+        run: flutter build apk --release ${{ needs.version.outputs.flutter-version-args }}
+
+      - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: remote_helm-android
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      - name: Copy for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cp build/app/outputs/flutter-apk/app-release.apk remote_helm-android.apk
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: release-android
+          path: remote_helm-android.apk
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux, build-windows, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

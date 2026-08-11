@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Remote Helm
+Comment=Remote control for Garmin ActiveCaptain-compatible chartplotters
+Exec=remote_helm
+Icon=remote_helm
+Terminal=false
+Categories=Utility;Network;
