@@ -423,7 +423,6 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     final host = _session.lastHost;
     if (host == null || host.isEmpty) return;
 
-    bool actuallySaved;
     try {
       final conn = await RouteCatalogConnection.connect(host);
       try {
@@ -431,31 +430,30 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
         // route_catalog_dialog.dart's matching comment: a catalog with
         // 200+ entries can occasionally need longer than 30s for the
         // sync this method runs before sending.
-        final routeUuid = await conn.addOrUpdateRoute(
+        //
+        // **Deliberately not verified afterward** — a real, if unlikely,
+        // failure mode where addOrUpdateRoute returns successfully but the
+        // route isn't actually in the catalog was found live-testing, but
+        // an immediate post-write verification sync turned out to be its
+        // own reliability risk at this catalog size (240+ entries): on the
+        // same connection it reliably made the plotter reset the TCP
+        // connection outright (generalizing an already-documented
+        // limitation — see route_catalog.dart's fetchObjects doc comment
+        // on two batch tGetObjects on one connection — to tCatalogSync as
+        // well), and even on a brand-new separate connection the sync
+        // reply consistently never arrived within 90s. Matches
+        // addOrUpdateWaypoint/deleteEntry, neither of which verifies
+        // after sending either.
+        await conn.addOrUpdateRoute(
           chosen.name,
           [for (final p in chosen.points) (p.lat, p.lon)],
           timeout: const Duration(seconds: 90),
         );
-        // **Verify, don't just trust "no exception"** — live testing found
-        // a case where addOrUpdateRoute returned normally (uuid, no error)
-        // but the route was NOT actually in the catalog afterward when the
-        // plotter was under load from back-to-back catalog operations. A
-        // second sync on the SAME still-open connection (cheap — no new
-        // handshake) checks the untrimmed entry list for the uuid just
-        // sent, so the user gets an honest failure instead of a false
-        // "saved" message in that case.
-        final allEntries = await conn.fetchCatalogUnfiltered(topicRoutes, timeout: const Duration(seconds: 90));
-        actuallySaved = allEntries.any((e) => e.uuid == routeUuid);
       } finally {
         await conn.close();
       }
     } on Object catch (e) {
       _showSnack('Failed to save "${chosen.name}" to the plotter: $e');
-      return;
-    }
-
-    if (!actuallySaved) {
-      _showSnack('"${chosen.name}" was sent, but did not appear in the plotter\'s catalog — try again.');
       return;
     }
 
