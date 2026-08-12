@@ -352,10 +352,21 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
       // text updates live even while queued behind another tab — only the
       // network calls themselves are serialized, not this widget's UI.
       final objects = await widget.enqueueLoad(() async {
-        final entries = await widget.conn.fetchCatalog(widget.topic);
+        // A catalog with 200+ entries has been observed occasionally
+        // needing longer than fetchCatalog's own 30s default for a sync
+        // reply — raised to 90s here to match the same timeout already
+        // used elsewhere (see route_catalog.dart's addOrUpdateWaypoint/
+        // addOrUpdateRoute and bin/verify_waypoint_exists.dart) rather
+        // than surfacing a spurious "no reply" failure for what's really
+        // just a slow-but-working sync.
+        final entries = await widget.conn.fetchCatalog(widget.topic, timeout: const Duration(seconds: 90));
         if (mounted) setState(() => _state = _Loading(entries.length));
         if (entries.isEmpty) return const <DownloadedObject>[];
-        return widget.conn.fetchObjects(widget.topic, entries.map((e) => e.uuid).toList());
+        return widget.conn.fetchObjects(
+          widget.topic,
+          entries.map((e) => e.uuid).toList(),
+          timeout: const Duration(seconds: 90),
+        );
       });
       if (!mounted) return;
       setState(() => _state = _Loaded(objects));
