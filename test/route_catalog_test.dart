@@ -1203,18 +1203,16 @@ void main() {
   });
 
   test('addOrUpdateWaypoint matches a real captured tDeleteEntry-shaped ADD message structurally', () async {
-    // **Reverted 2026-08-12 back to the registration-correlation-id
-    // method** — see addOrUpdateWaypoint's own doc comment: the
-    // sync+merge-priming mechanism was tried, but the current catalog
-    // (220 entries) is larger than anything that mechanism has ever been
-    // confirmed working against, and both a single full-catalog batch and
-    // a chunked version reliably tripped the plotter's lockout live. This
-    // test rebuilds the "0005" message with the same
-    // uuid/vstamp/name/coordinates, feeding this connection the real
-    // capture's own topicWaypoints REGISTRATION correlation id (not a
-    // synced remote_ver) as the fake server's registration reply — the
-    // exact source addOrUpdateWaypoint's prevRemoteVer now comes from —
-    // then checks every structural field against the real captured bytes.
+    // **Resolved 2026-08-12** — see addOrUpdateWaypoint's own doc comment:
+    // real captures of successful creates show `prevRemoteVer` is simply
+    // "whatever remote_ver this connection most recently learned for the
+    // topic", which this method now gets by always running a fresh
+    // tCatalogSync (no merge-priming batch download) immediately before
+    // building the message. This test rebuilds the "0005" message with
+    // the same uuid/vstamp/name/coordinates, has the fake server answer
+    // that sync with [_fakeRemoteVer], then checks every structural field
+    // against the real captured bytes and that prevRemoteVer matches the
+    // synced value.
     final capturedRest = _hexToBytes(
       'fa01f04dd432f4020000d4f0d5c9f5020000e8010107e40101e10105071110'
       'f34fe4371e0a4fb886b1e07788826a820dc99deeca251102190127c0010201'
@@ -1231,7 +1229,6 @@ void main() {
     late StreamSubscription<Socket> serverSub;
     final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     Uint8List? sentRest;
-    Uint8List? waypointsRegistrationCorrelationId;
 
     serverSub = fakeServer.listen((client) {
       final buf = BytesBuilder(copy: false);
@@ -1250,22 +1247,33 @@ void main() {
           if (msgType == 0x07) continue;
 
           if (msgType == tRegisterTopic) {
-            // topicWaypoints gets NO reply at all -- matches the real
-            // capture's own timing and exercises _registerTopic's own
-            // stashed-correlation-id fallback (addOrUpdateWaypoint's
-            // prevRemoteVer source) rather than a server-confirmed one.
-            if (topicId == topicWaypoints) {
-              waypointsRegistrationCorrelationId = Uint8List.sublistView(request, 6 + 3, 6 + 3 + 8);
-              continue;
-            }
-            // topicTrack (0x4, part of _ensurePreamble's own fixed
-            // handshake) DOES need a reply -- _ensurePreamble blocks on it
-            // unconditionally, unrelated to this test's own topicWaypoints
-            // scenario.
             final replyInner = Uint8List(6 + 8);
             ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
             ByteData.view(replyInner.buffer).setUint16(4, tRegisterTopicReply, Endian.little);
             replyInner[6] = 8;
+            client.add(_wrapMsgFrame(replyInner));
+            continue;
+          } else if (msgType == tCatalogSync) {
+            // addOrUpdateWaypoint now always syncs first to get a current
+            // remote_ver -- see this test's own doc comment. _syncCatalog
+            // requires (via _awaitCatalogSyncReply) the reply's own
+            // correlation id at prefixLen(1) + 1 = offset 2 to match the
+            // request's, and separately reads remote_ver at offset 18
+            // (prefixLen + 1 + 16) -- both confirmed against a real
+            // captured reply's own bytes, not just this file's other
+            // fixtures (an earlier version of this fixture omitted the
+            // correlation id and copied a different remote_ver offset (26)
+            // used elsewhere in this file for a differently-shaped reply,
+            // which made _awaitCatalogSyncReply never match and time out).
+            final requestRest = request.sublist(6);
+            final requestCorrelationId = requestRest.sublist(1, 9);
+            final replyRest = Uint8List(18 + 8)
+              ..setRange(2, 10, requestCorrelationId)
+              ..setRange(18, 26, _fakeRemoteVer);
+            final replyInner = Uint8List(6 + replyRest.length);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tCatalogSyncReply, Endian.little);
+            replyInner.setRange(6, 6 + replyRest.length, replyRest);
             client.add(_wrapMsgFrame(replyInner));
             continue;
           } else if (msgType == tDeleteEntry) {
@@ -1302,9 +1310,8 @@ void main() {
     expect(sentRest, isNotNull, reason: 'the add/update message must have been sent');
     final actual = _decodeAddOrUpdateStructure(sentRest!);
 
-    expect(waypointsRegistrationCorrelationId, isNotNull, reason: 'the topicWaypoints registration must have been sent');
     final actualPrevRemoteVer = Uint8List.sublistView(sentRest!, _leb128Length(sentRest!, 0), _leb128Length(sentRest!, 0) + 8);
-    expect(actualPrevRemoteVer, waypointsRegistrationCorrelationId);
+    expect(actualPrevRemoteVer, _fakeRemoteVer, reason: 'prevRemoteVer must come from the fresh tCatalogSync, not a stale correlation id');
 
     expect(actual.fieldCount, expected.fieldCount);
     expect(actual.uuidMarker, expected.uuidMarker);
@@ -1404,7 +1411,17 @@ _AddOrUpdateStructure _decodeAddOrUpdateStructure(Uint8List rest) {
   var o = 2; // fixed 01 07
   final aLen = _leb128Length(tail, o);
   final a = _leb128Value(tail, o);
-  o += aLen + 1; // + fixed 02
+  o += aLen;
+  // **Bug found 2026-08-12**: this byte was long assumed to be a fixed
+  // `0x02` (mirrored from deleteEntry's own, differently-shaped `03`
+  // marker) but every real captured create frame examined has `0x01`
+  // here -- this decoder now asserts it explicitly instead of silently
+  // skipping over it, so a regression back to the wrong value fails
+  // loudly instead of passing structurally while being byte-wrong.
+  if (tail[o] != 0x01) {
+    throw StateError('expected marker byte 0x01 at offset $o, got 0x${tail[o].toRadixString(16)}');
+  }
+  o += 1;
   final bLen = _leb128Length(tail, o);
   final b = _leb128Value(tail, o);
   o += bLen;

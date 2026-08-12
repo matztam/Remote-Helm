@@ -937,32 +937,7 @@ class RouteCatalogConnection {
       ...correlationId,
     ]);
     _registeredTopics.add(topic);
-    // Stashed as [addOrUpdateWaypoint]'s `prevRemoteVer` source — see its
-    // own doc comment for why this (not a synced remote_ver, not a merge-
-    // priming batch download) is what a real create/update's version-stamp
-    // chain starts from when the topic hasn't already been synced on this
-    // connection: the one real capture that actually worked (two waypoints
-    // created back-to-back, `topicWaypoints` never synced at all
-    // beforehand) has its first create's `prevRemoteVer` byte-identical to
-    // this exact registration correlation id.
-    //
-    // **Deliberately a SEPARATE map from [_remoteVerByTopic]**: an earlier
-    // version stashed this into [_remoteVerByTopic] itself (via
-    // `putIfAbsent`), reasoning that a real sync's own result would always
-    // overwrite it when available. That broke [_ensureTopicReady] (used by
-    // [fetchObject]/[fetchObjects]), which decides whether to run a real
-    // [_syncCatalog] purely by checking whether [_remoteVerByTopic] already
-    // has an entry for the topic — this fallback value being present there
-    // made it skip that sync entirely, even though nothing had actually
-    // synced yet. [_remoteVerByTopic] must only ever contain real,
-    // server-confirmed values; this fallback lives in its own map instead,
-    // read only by [addOrUpdateWaypoint].
-    _registrationCorrelationIdByTopic.putIfAbsent(topic, () => correlationId);
   }
-
-  /// See [_registerTopic]'s doc comment for why this is a separate map
-  /// from [_remoteVerByTopic] rather than sharing it.
-  final Map<int, Uint8List> _registrationCorrelationIdByTopic = {};
 
   /// Registers every topic in [auxiliaryTopics] on this connection —
   /// **experimental, added 2026-08-09**. The real app always keeps a
@@ -1111,6 +1086,19 @@ class RouteCatalogConnection {
   Future<List<CatalogEntry>> fetchCatalog(int topic, {Duration timeout = const Duration(seconds: 30)}) async {
     final result = await _fetchCatalog(topic, timeout: timeout);
     return result.entries;
+  }
+
+  /// Like [fetchCatalog], but returns every raw entry the sync reply
+  /// listed, without the `validCount` trim [fetchCatalog] applies — see
+  /// [_syncCatalog]'s doc comment for the known bug where that trim can
+  /// drop a real, just-created entry sitting past the trim point.
+  /// [deleteEntry] already relies on this same untrimmed list internally
+  /// for its own uuid lookup; exposed here so external verification (e.g.
+  /// [addOrUpdateWaypoint] callers checking whether a create landed) can
+  /// do the same instead of trusting the trimmed view.
+  Future<List<CatalogEntry>> fetchCatalogUnfiltered(int topic, {Duration timeout = const Duration(seconds: 30)}) async {
+    final result = await _fetchCatalog(topic, timeout: timeout);
+    return result.allEntries;
   }
 
   /// Shared implementation for [fetchCatalog] and [fetchCatalogAndObjects]
@@ -2109,62 +2097,53 @@ class RouteCatalogConnection {
   ///
   /// Creates or updates a waypoint on the plotter's catalog.
   ///
-  /// **⚠ STATUS as of 2026-08-12: still not confirmed working live.** The
-  /// message this method sends is structurally byte-perfect against the
-  /// one real capture available of the official app creating a waypoint —
-  /// verified field-by-field, including a real wire-format bug found and
-  /// fixed this session (the object's own `vstamp` field must be a
-  /// variable-length tagged value, not padded to a fixed width). Multiple
-  /// `prevRemoteVer` sourcing strategies have been live-tested against the
-  /// real plotter: the registration-time correlation id (current
-  /// approach, matches the one real capture available), a freshly-synced
-  /// `remote_ver`, and [deleteEntry]'s own sync-then-batch-download
-  /// merge-priming sequence (in both a single unchunked batch and a
-  /// chunked variant) — **none of them produced a waypoint that
-  /// durably appeared in the plotter's catalog afterward**, even though
-  /// every attempt sent without any error or rejection from the plotter.
-  /// Also ruled out: send timing/delay after registration, keeping the
-  /// connection open vs. reconnecting for verification, and sending from
-  /// a fully HTTP-paired-and-authorized device identity (see
-  /// `credential.dart`'s `pair()`) instead of an unpaired connection.
-  /// **The real remaining difference from the working app is still
-  /// unknown.** Two promising, not-yet-analyzed real captures of the
-  /// official app creating multiple *routes* (not waypoints) back-to-back
-  /// exist and should be the next thing checked — routes might follow a
-  /// different, more completely-captured mechanism than the single
-  /// waypoint-creation capture this method is currently modeled on.
+  /// **✅ STATUS as of 2026-08-12: confirmed working live** — a real
+  /// created waypoint was independently verified present in the plotter's
+  /// own catalog afterward (fresh connection, untrimmed catalog listing),
+  /// resolving weeks of otherwise byte-perfect live failures. Two things
+  /// were needed, found via two fresh real captures (`bb58f5ed`: waypoints
+  /// "0008"/"0009" + route "49"; `4fdcc705`: route "Vlissingen -> R", 16
+  /// points):
   ///
-  /// **Reverse-engineered 2026-08-11**, across four real captures and
-  /// several live attempts. The wire format itself (this method's own
+  /// 1. **A wrong fixed byte in [_buildAddOrUpdateBody]'s tail**, found by
+  ///    re-deriving every field of the tail from scratch against four real
+  ///    create frames (not just re-checking the fields already believed
+  ///    correct): the byte right after `A`'s own LEB128 encoding was
+  ///    hardcoded `0x02` (copied by analogy from [deleteEntry]'s
+  ///    differently-shaped `03` marker at a similar position) but is
+  ///    `0x01` in every real frame examined. This is the most likely real
+  ///    explanation for every earlier live failure — the message always
+  ///    sent cleanly (lengths and self-referential offsets all still
+  ///    checked out with the wrong byte in place) but the plotter silently
+  ///    dropped it.
+  /// 2. `prevRemoteVer` is simply **the most recently known `remote_ver`
+  ///    for the topic on this connection** — sourced from a real sync when
+  ///    one happened to run for another reason, or straight from the
+  ///    topic's registration correlation id when nothing else had touched
+  ///    it since. The protocol doesn't care which; it only cares that the
+  ///    value is current. This method now always runs a fresh
+  ///    [_fetchCatalog] sync immediately before building the message —
+  ///    **without** the merge-completion batch download [deleteEntry]
+  ///    additionally needs (that batch is what didn't scale past ~118
+  ///    entries and caused repeated plotter lockouts in earlier attempts;
+  ///    omitting it here matches both real captures, neither of which ran
+  ///    a batch `tGetObject` before a create).
+  ///
+  /// **Known rough edge**: this method's own mandatory sync-before-every-
+  /// call, against a catalog that has grown past 200 entries, has been
+  /// observed triggering the plotter's "user data sharing disabled"
+  /// lockout shortly after a call completes (a real, previously-documented
+  /// plotter protection state — see this file's own top-level notes) —
+  /// not confirmed whether this is inherent to syncing a catalog this
+  /// large at all, or specific to doing it right before another write.
+  /// Not yet a problem for a single call; something to watch for repeated
+  /// calls in quick succession.
+  ///
+  /// **Reverse-engineered 2026-08-11/12**, across six real captures and
+  /// many live attempts. The wire format itself (this method's own
   /// tail-building, shared with [deleteEntry] via [_buildAddOrUpdateBody])
-  /// was correct from early on — every earlier live failure was actually
-  /// **`prevRemoteVer`**, not the message shape:
-  ///
-  /// - The first two live attempts (`vstamp: 0`, then a plausible non-zero
-  ///   `vstamp`) both used a `prevRemoteVer` from a full, real
-  ///   [_fetchCatalog] sync — the same source [deleteEntry] uses on its
-  ///   own syncing path. Sent successfully, but the catalog never changed.
-  /// - **The real capture that finally worked (`83d8898e`) never
-  ///   synced `topicWaypoints` at all before its two creates.** Its first
-  ///   create's `prevRemoteVer` (`f04dd432f4020000`, `seq=756`) is
-  ///   BYTE-IDENTICAL to the correlation id `_registerTopic` sent when
-  ///   registering `topicWaypoints` moments earlier on the same
-  ///   connection — not a server-synced value at all, just this
-  ///   connection's own registration-time correlation id, reused. (The
-  ///   second create's `prevRemoteVer` then chains normally from the
-  ///   first's `newRemoteVer`, same as consecutive real deletes already
-  ///   documented.) [_registerTopic] now stashes that value into
-  ///   [_remoteVerByTopic] itself (see its own doc comment) specifically
-  ///   so this method — and any future caller needing a plausible
-  ///   `prevRemoteVer` without forcing a real sync — can read it back.
-  /// - A live-fetched `remote_ver` is real and server-confirmed, but
-  ///   apparently NOT what the plotter expects as the baseline for a
-  ///   brand-new object's version-stamp chain; the registration-time
-  ///   correlation id is. Exactly why is unconfirmed — plausibly the real
-  ///   app simply never bothers syncing before a create when it already
-  ///   has *some* locally-cached version-stamp-shaped value to start
-  ///   from, and the plotter accepts anything of the right shape as a
-  ///   starting point rather than validating it against server state.
+  /// had exactly one wrong byte, found only once a full field-by-field
+  /// re-derivation was done instead of re-checking already-trusted fields.
   ///
   /// **The object's own `vstamp` — client-generated, `seq=2` on every
   /// real create seen.** Four real captures' new-object vstamps all
@@ -2198,10 +2177,10 @@ class RouteCatalogConnection {
     // behavior for real callers.
     Duration? debugDelayBeforeSend,
   }) async {
-    await _ensurePreamble(timeout);
-    _registerTopic(topicWaypoints);
-    _registerTopic(topicRoutes);
     if (debugDelayBeforeSend != null) {
+      await _ensurePreamble(timeout);
+      _registerTopic(topicWaypoints);
+      _registerTopic(topicRoutes);
       await Future<void>.delayed(debugDelayBeforeSend);
     }
 
@@ -2236,29 +2215,33 @@ class RouteCatalogConnection {
       'sym': 18,
     };
 
-    // **Aligned with [deleteEntry]'s own, live-confirmed-working mechanism
-    // — 2026-08-12, REVERTED same day.** [deleteEntry]'s sync+merge-
-    // priming mechanism was tried here on the theory that it's the
-    // "proven" pattern to follow — but the catalog (220 entries today) is
-    // larger than any size this mechanism has ever actually been
-    // confirmed working against (118 waypoints, 2026-08-08). A single
-    // full-catalog batch tGetObject gets no reply at all; chunking it
-    // does too — this file's own [fetchObjects] doc comment already
-    // documented on 2026-08-08 that "the plotter apparently cannot handle
-    // a second batch tGetObject on the same topic on the same connection,
-    // chunked or not", which this change briefly, mistakenly re-violated,
-    // reproducing the exact same lockout live. There is no real capture
-    // showing what the actual app does with a catalog this large, so
-    // neither "one big batch" nor "chunked batches" is validated at this
-    // scale — both are just guesses. Reverted to the registration-
-    // correlation-id method (still structurally byte-perfect against the
-    // real "0005" capture) to remove the batch download as a variable
-    // entirely while the real remaining difference from the actual app's
-    // behavior is still being tracked down.
-    final prevRemoteVer = _remoteVerByTopic[topicWaypoints] ?? _registrationCorrelationIdByTopic[topicWaypoints];
-    if (prevRemoteVer == null) {
-      throw RouteCatalogException('no remote_ver available for topicWaypoints — _registerTopic should have stashed one');
-    }
+    // **Resolved 2026-08-12** via two fresh real captures showing actual
+    // successful creates (`bb58f5ed`: waypoints "0008"/"0009" + route "49";
+    // `4fdcc705`: route "Vlissingen -> R"). `prevRemoteVer` is simply
+    // "whatever `remote_ver` this connection most recently learned for the
+    // topic" — the protocol doesn't care whether that value came from the
+    // topic's registration correlation id or a real sync reply, only that
+    // it's current. Both real captures confirm this: `bb58f5ed` synced
+    // `topicWaypoints` immediately before its creates (its `prevRemoteVer`
+    // is byte-identical to the sync reply's `remote_ver`, not the
+    // registration correlation id); `4fdcc705` did NOT sync `topicWaypoints`
+    // before its waypoint creates (nothing else had touched that topic
+    // since registration, so the registration correlation id was still
+    // current) but DID sync `topicRoutes` first (three routes had been
+    // deleted earlier in the same session, advancing that topic's real
+    // `remote_ver` past its registration-time value, which would have
+    // left an outdated correlation id if it hadn't synced) — this shows
+    // why the earlier registration-correlation-id-only approach could
+    // plausibly fail
+    // during a long-lived test session with multiple prior writes: the
+    // cached value goes stale and the plotter silently drops a write
+    // built on a stale `prevRemoteVer`. Syncing immediately before every
+    // add/update — without the merge-completion batch download
+    // [deleteEntry] additionally needs — always produces a current value
+    // regardless of which case applies, at the cost of one extra
+    // round-trip per call.
+    final sync = await _fetchCatalog(topicWaypoints, timeout: timeout);
+    final prevRemoteVer = sync.remoteVer;
     final newRemoteVer = _freshRemoteVerLikeValue(prevRemoteVer);
     final body = _buildAddOrUpdateBody(
       uuid: targetUuid,
@@ -2341,10 +2324,23 @@ class RouteCatalogConnection {
     final bBytes = _encodeUnsignedLeb128(b);
     final a = b + bBytes.length + 1;
 
+    // **Bug found 2026-08-12** via a strict byte-by-byte re-derivation of
+    // this marker against four real create frames across two fresh
+    // captures (`bb58f5ed`, `4fdcc705`) — every one of them has `0x01`
+    // here, not `0x02`. Confirmed via the `a = b + lebLen(b) + 1` identity
+    // holding exactly in every real frame once the byte at this position
+    // is excluded from `b`'s own encoding (it isn't part of `b`'s LEB128 —
+    // `b`'s bytes start right after it, same as this method already
+    // assumed). This one wrong byte, sent on every single previous live
+    // attempt, is the most likely real explanation for why the message
+    // always sent successfully (byte count/self-referential lengths all
+    // still checked out) but the plotter never durably added the object —
+    // it's plausible this second-position marker actually carries some
+    // meaning (unconfirmed what) that the plotter validates.
     final tail = <int>[
       0x01, 0x07,
       ..._encodeUnsignedLeb128(a),
-      0x02,
+      0x01,
       ...bBytes,
       ...fieldTable,
     ];

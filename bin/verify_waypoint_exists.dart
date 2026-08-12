@@ -11,10 +11,10 @@ Future<void> main(List<String> args) async {
 
   stdout.writeln('Connecting to $host:$routeCatalogPort …');
   final conn = await RouteCatalogConnection.connect(host, timeout: const Duration(seconds: 10));
-  stdout.writeln('fetchCatalog(waypoints) …');
-  final entries = await conn.fetchCatalog(topicWaypoints, timeout: const Duration(seconds: 60));
-  stdout.writeln('  ${entries.length} entries');
-  final found = entries.any((e) => e.uuid == targetUuid);
+  stdout.writeln('fetchCatalogUnfiltered(waypoints) …');
+  final allEntries = await conn.fetchCatalogUnfiltered(topicWaypoints, timeout: const Duration(seconds: 60));
+  stdout.writeln('  ${allEntries.length} raw entries (untrimmed -- includes any non-fetchable phantom entries fetchCatalog would trim out)');
+  final found = allEntries.any((e) => e.uuid == targetUuid);
   stdout.writeln(found ? '=== FOUND: $targetUuid ===' : '!!! NOT FOUND: $targetUuid');
   await conn.close();
 }
