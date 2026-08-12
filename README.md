@@ -56,12 +56,13 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   plotter over its own sync channel — no SD card, no cloud round-trip.
   Supports routes of any point count (see `lib/helm/route_sync.dart`'s doc
   comment for the one remaining known gap).
-- **Browse, save, share & delete plotter routes/waypoints**: lists every
-  route, waypoint, and saved track stored on the plotter and lets you save
-  any of them as a `.gpx` file, share it via the platform share sheet, or
-  delete it from the plotter — the reverse direction of the import above,
-  over a completely separate channel (see `lib/helm/route_catalog.dart`).
-  Confirmed working live end-to-end.
+- **Browse, download & delete plotter routes, waypoints & tracks**: lists
+  every route, waypoint, and saved track stored on the plotter, and for
+  each one lets you download it as a `.gpx` file (to save locally or share
+  via the platform share sheet) or delete it from the plotter — the
+  reverse direction of the import above, over a completely separate
+  channel (see `lib/helm/route_catalog.dart`). Confirmed working live
+  end-to-end.
 - **Creating/updating waypoints directly on the plotter** (`lib/helm/
   route_catalog.dart`'s `addOrUpdateWaypoint`): work in progress, not yet
   exposed in the UI. The message is sent successfully and matches the
