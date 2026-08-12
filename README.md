@@ -10,6 +10,8 @@ It shows the plotter's live screen (RTSP/H.264 video) and forwards
 touch/mouse/scroll input back to it (tap, drag, pinch-to-zoom), so it works
 as an alternative touchscreen for the plotter over Wi-Fi.
 
+![remote_helm running on Android, connected to a live plotter, showing the Charts tab](docs/img/screenshot_android.png)
+
 ## Credit
 
 This project is a Flutter/Dart port and continuation of
