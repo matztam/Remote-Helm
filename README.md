@@ -1,4 +1,4 @@
-# remote_helm
+# Remote-Helm
 
 A cross-platform (Windows, Linux, Android) remote control app for Garmin
 chartplotters that support the ActiveCaptain Helm remote — the same
@@ -83,10 +83,10 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
 ## Downloads
 
 Prebuilt binaries for all three platforms are published on the
-[Releases page](https://github.com/matztam/remote_helm/releases) whenever
+[Releases page](https://github.com/matztam/Remote-Helm/releases) whenever
 a version is tagged. If you'd rather grab the latest build off `master`
 without waiting for a tagged release, every push also builds all three
-platforms in [Actions](https://github.com/matztam/remote_helm/actions) —
+platforms in [Actions](https://github.com/matztam/Remote-Helm/actions) —
 open the newest successful "Build" run and download the platform you want
 from its Artifacts section (requires being signed in to GitHub; tagged
 Releases don't).
