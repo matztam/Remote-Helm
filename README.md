@@ -60,6 +60,13 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   delete it from the plotter — the reverse direction of the import above,
   over a completely separate channel (see `lib/helm/route_catalog.dart`).
   Confirmed working live end-to-end.
+- **Creating/updating waypoints directly on the plotter** (`lib/helm/
+  route_catalog.dart`'s `addOrUpdateWaypoint`): work in progress, not yet
+  exposed in the UI. The message is sent successfully and matches the
+  real app's wire format field-for-field, but hasn't been confirmed to
+  durably appear in the plotter's own catalog afterward yet — see that
+  method's doc comment for the current status and what's already been
+  ruled out.
 
 ## Requirements
 
