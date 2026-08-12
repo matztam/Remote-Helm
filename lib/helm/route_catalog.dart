@@ -2256,10 +2256,81 @@ class RouteCatalogConnection {
     return targetUuid;
   }
 
-  /// Builds the shared tail structure [addOrUpdateWaypoint] (and, once
-  /// implemented, a route-upload counterpart) uses — see
-  /// [addOrUpdateWaypoint]'s doc comment for the full field-by-field wire
-  /// format derivation.
+  /// Creates or updates a route on the plotter's catalog, given a list of
+  /// `(lat, lon)` points — same envelope/tail mechanism as
+  /// [addOrUpdateWaypoint] (see its doc comment for the full derivation),
+  /// on [topicRoutes] instead of [topicWaypoints], with a different JSON
+  /// object shape: `name`/`uuid`/`auto_name`/`proto_ver`/`min_proto_ver`/
+  /// `vstamp`/`points` instead of a waypoint's `lat`/`lon`/`dspl_optn`/etc.
+  ///
+  /// **✅ Confirmed working live 2026-08-12** — a created route was
+  /// independently verified present in the plotter's own catalog
+  /// afterward (fresh connection, untrimmed catalog listing).
+  ///
+  /// **Deliberately NOT matching the real app's own behavior for
+  /// `points`.** Real captures (`bb58f5ed`'s route "49", `4fdcc705`'s
+  /// route "Vlissingen -> R") show the official app always creates one
+  /// separate, real, independently-visible waypoint object per route
+  /// point FIRST, then references them by uuid:
+  /// `"points":[{"lon":...,"lat":...,"ref":{"class":"uwpt","uuid":"..."}}]`
+  /// — never raw coordinates. That's a real app UX quirk (every route you
+  /// create there also litters the waypoint list with one hidden-looking
+  /// entry per point), not something this client should reproduce —
+  /// confirmed by the plotter's own UI behaving the same way when a route
+  /// is drawn directly on it (no extra waypoints appear either). This
+  /// method instead sends `points` with embedded `lon`/`lat` directly, no
+  /// `ref`/`uuid` — a guess with no real-capture precedent when first
+  /// written, but the live test above confirms the plotter accepts it: a
+  /// 3-point route created and durably found in the catalog afterward,
+  /// with no corresponding entries added to the waypoint catalog.
+  ///
+  /// **Not yet tested**: larger point counts (only 3 points tried so far),
+  /// and updating an existing route (only create tried so far — this
+  /// method always generates a fresh uuid unless one is passed in, same
+  /// caveat as [addOrUpdateWaypoint]'s own `uuid` parameter).
+  Future<String> addOrUpdateRoute(
+    String name,
+    List<(double lat, double lon)> points, {
+    String? uuid,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final targetUuid = uuid ?? _formatUuid(_randomUuidBytes());
+    final random = Random();
+    final objectVstamp = (2 << 32) | random.nextInt(0x100000000);
+
+    final json = <String, dynamic>{
+      'name': name,
+      'uuid': targetUuid,
+      'auto_name': false,
+      'proto_ver': 2,
+      'min_proto_ver': 1,
+      'vstamp': objectVstamp,
+      'points': [
+        for (final (lat, lon) in points) {'lon': _toGarminSemicircle(lon), 'lat': _toGarminSemicircle(lat)},
+      ],
+    };
+
+    // See [addOrUpdateWaypoint]'s doc comment for why this always syncs
+    // immediately before sending rather than trusting a cached remote_ver.
+    final sync = await _fetchCatalog(topicRoutes, timeout: timeout);
+    final prevRemoteVer = sync.remoteVer;
+    final newRemoteVer = _freshRemoteVerLikeValue(prevRemoteVer);
+    final body = _buildAddOrUpdateBody(
+      uuid: targetUuid,
+      vstamp: objectVstamp,
+      json: json,
+      prevRemoteVer: prevRemoteVer,
+      newRemoteVer: newRemoteVer,
+    );
+
+    _send(topicRoutes, tDeleteEntry, 0, body);
+    _remoteVerByTopic[topicRoutes] = newRemoteVer;
+    return targetUuid;
+  }
+
+  /// Builds the shared tail structure [addOrUpdateWaypoint] and
+  /// [addOrUpdateRoute] use — see [addOrUpdateWaypoint]'s doc comment for
+  /// the full field-by-field wire format derivation.
   List<int> _buildAddOrUpdateBody({
     required String uuid,
     required int vstamp,

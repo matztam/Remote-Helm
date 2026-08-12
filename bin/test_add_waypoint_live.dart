@@ -7,7 +7,7 @@ import '../lib/helm/route_catalog.dart';
 /// to check whether the waypoint durably appeared in the catalog.
 Future<void> main() async {
   const host = '172.16.6.0';
-  const testName = 'CLAUDE_TEST20';
+  const testName = 'CLAUDE_TEST21';
   const testLat = 55.7;
   const testLon = 10.05;
 
@@ -17,7 +17,7 @@ Future<void> main() async {
   final conn = await RouteCatalogConnection.connect(host, timeout: const Duration(seconds: 15));
 
   stdout.writeln('addOrUpdateWaypoint("$testName", $testLat, $testLon) …');
-  final uuid = await conn.addOrUpdateWaypoint(testName, testLat, testLon, timeout: const Duration(seconds: 15));
+  final uuid = await conn.addOrUpdateWaypoint(testName, testLat, testLon, timeout: const Duration(seconds: 45));
   stdout.writeln('addOrUpdateWaypoint() returned, no exception. uuid=$uuid');
 
   await conn.close();
