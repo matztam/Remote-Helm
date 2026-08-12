@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -1200,4 +1201,264 @@ void main() {
       throwsA(isA<RouteCatalogException>()),
     );
   });
+
+  test('addOrUpdateWaypoint matches a real captured tDeleteEntry-shaped ADD message structurally', () async {
+    // **Reverted 2026-08-12 back to the registration-correlation-id
+    // method** — see addOrUpdateWaypoint's own doc comment: the
+    // sync+merge-priming mechanism was tried, but the current catalog
+    // (220 entries) is larger than anything that mechanism has ever been
+    // confirmed working against, and both a single full-catalog batch and
+    // a chunked version reliably tripped the plotter's lockout live. This
+    // test rebuilds the "0005" message with the same
+    // uuid/vstamp/name/coordinates, feeding this connection the real
+    // capture's own topicWaypoints REGISTRATION correlation id (not a
+    // synced remote_ver) as the fake server's registration reply — the
+    // exact source addOrUpdateWaypoint's prevRemoteVer now comes from —
+    // then checks every structural field against the real captured bytes.
+    final capturedRest = _hexToBytes(
+      'fa01f04dd432f4020000d4f0d5c9f5020000e8010107e40101e10105071110'
+      'f34fe4371e0a4fb886b1e07788826a820dc99deeca251102190127c0010201'
+      '000fba01b8011f8b08000000000004034d8edb0a83301044fb2dfb1c615773'
+      '59f333126ba482b9a05128a5ffde4829f46d663833cc0b8e6399c0c2dcc9d9'
+      'cbce34e4d135721eb9613d52e3d118666eb5e31604e42d95349c7e03db0a08'
+      '4b1cfe1212b0ba02562b85a6d746559f2258226da86fb936a63daf43cae54a'
+      'fb6a7d2e0fb0f1585701c587fcd3a12cc15f4da53a369d9202cebdb80b2044'
+      'ee090dc9ba1fdd850122aafaee9e42f0b13ef80eeecf50717edf3e34844bf6'
+      'e6000000',
+    );
+    final expected = _decodeAddOrUpdateStructure(capturedRest);
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    Uint8List? sentRest;
+    Uint8List? waypointsRegistrationCorrelationId;
+
+    serverSub = fakeServer.listen((client) {
+      final buf = BytesBuilder(copy: false);
+
+      client.listen((chunk) {
+        buf.add(chunk);
+        var bytes = buf.toBytes();
+        while (bytes.length >= 8) {
+          final length = ByteData.sublistView(bytes, 4, 8).getUint32(0, Endian.little);
+          if (bytes.length < 8 + length) break;
+          final request = bytes.sublist(8, 8 + length);
+          bytes = bytes.sublist(8 + length);
+          if (request.length < 6) continue;
+          final topicId = ByteData.sublistView(request, 0, 4).getUint32(0, Endian.little);
+          final msgType = ByteData.sublistView(request, 4, 6).getUint16(0, Endian.little);
+          if (msgType == 0x07) continue;
+
+          if (msgType == tRegisterTopic) {
+            // topicWaypoints gets NO reply at all -- matches the real
+            // capture's own timing and exercises _registerTopic's own
+            // stashed-correlation-id fallback (addOrUpdateWaypoint's
+            // prevRemoteVer source) rather than a server-confirmed one.
+            if (topicId == topicWaypoints) {
+              waypointsRegistrationCorrelationId = Uint8List.sublistView(request, 6 + 3, 6 + 3 + 8);
+              continue;
+            }
+            // topicTrack (0x4, part of _ensurePreamble's own fixed
+            // handshake) DOES need a reply -- _ensurePreamble blocks on it
+            // unconditionally, unrelated to this test's own topicWaypoints
+            // scenario.
+            final replyInner = Uint8List(6 + 8);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tRegisterTopicReply, Endian.little);
+            replyInner[6] = 8;
+            client.add(_wrapMsgFrame(replyInner));
+            continue;
+          } else if (msgType == tDeleteEntry) {
+            sentRest = Uint8List.sublistView(request, 6);
+          }
+        }
+        buf.clear();
+        buf.add(bytes);
+      });
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    RouteCatalogConnection.debugTrace = true;
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+    addTearDown(() => RouteCatalogConnection.debugTrace = false);
+
+    await conn.addOrUpdateWaypoint(
+      '0005',
+      655079675 * 180.0 / 2147483648.0,
+      116719282 * 180.0 / 2147483648.0,
+      uuid: 'f34fe437-1e0a-4fb8-86b1-e07788826a82',
+      timeout: const Duration(seconds: 2),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(sentRest, isNotNull, reason: 'the add/update message must have been sent');
+    final actual = _decodeAddOrUpdateStructure(sentRest!);
+
+    expect(waypointsRegistrationCorrelationId, isNotNull, reason: 'the topicWaypoints registration must have been sent');
+    final actualPrevRemoteVer = Uint8List.sublistView(sentRest!, _leb128Length(sentRest!, 0), _leb128Length(sentRest!, 0) + 8);
+    expect(actualPrevRemoteVer, waypointsRegistrationCorrelationId);
+
+    expect(actual.fieldCount, expected.fieldCount);
+    expect(actual.uuidMarker, expected.uuidMarker);
+    expect(actual.uuid, expected.uuid);
+    expect(actual.vstampTagByte, expected.vstampTagByte);
+    expect(actual.protoVerTagByte, expected.protoVerTagByte);
+    expect(actual.protoVer, expected.protoVer);
+    expect(actual.minProtoVerTagByte, expected.minProtoVerTagByte);
+    expect(actual.minProtoVer, expected.minProtoVer);
+    expect(actual.wptDataTagByte, expected.wptDataTagByte);
+    expect(actual.memberLengthMarker, expected.memberLengthMarker);
+    // self-referential A/B relationship, not equality with the real
+    // capture's own values (this message's newRemoteVer has a freshly
+    // randomized `sub` half, which shifts the LEB128 width these offsets
+    // depend on) -- see addOrUpdateWaypoint's doc comment.
+    expect(actual.bLebLen + 1, actual.a - actual.b);
+    // vstamp itself is freshly randomized per call (seq=2 fixed, sub
+    // random -- see addOrUpdateWaypoint's doc comment), so only seq is
+    // checked against the real capture, not the exact value.
+    expect(actual.vstamp >> 32, expected.vstamp >> 32);
+    expect(actual.json['uuid'], expected.json['uuid']);
+    expect(actual.json['lat'], expected.json['lat']);
+    expect(actual.json['lon'], expected.json['lon']);
+    expect(actual.json['name'], expected.json['name']);
+    // The full real field set -- corrected 2026-08-11 after a live create
+    // with only the "obvious" fields sent successfully but didn't
+    // actually appear in the catalog. dspl_optn/sym are constant across
+    // every real create capture examined; depth/temp/comment are always
+    // null; mtime is a fresh timestamp so only its presence is checked.
+    expect(actual.json['dspl_optn'], expected.json['dspl_optn']);
+    expect(actual.json['depth'], isNull);
+    expect(actual.json['temp'], isNull);
+    expect(actual.json['comment'], isNull);
+    expect(actual.json['sym'], expected.json['sym']);
+    expect(actual.json['mtime'], isNotNull);
+  });
+}
+
+/// Decoded structural fields of an [RouteCatalogConnection.addOrUpdateWaypoint]
+/// wire message, extracted anchor-by-anchor (not a fixed byte offset) so
+/// this test can compare a real captured message against a freshly-sent
+/// one whose `newRemoteVer`/self-referential length fields necessarily
+/// differ byte-for-byte even when every meaningful field matches -- see
+/// addOrUpdateWaypoint's own doc comment for the full field derivation.
+class _AddOrUpdateStructure {
+  final int a;
+  final int b;
+  final int bLebLen;
+  final int fieldCount;
+  final Uint8List uuidMarker;
+  final Uint8List uuid;
+  final int vstampTagByte;
+  final int vstamp;
+  final int protoVerTagByte;
+  final int protoVer;
+  final int minProtoVerTagByte;
+  final int minProtoVer;
+  final int wptDataTagByte;
+  final Uint8List memberLengthMarker;
+  final Map<String, dynamic> json;
+
+  const _AddOrUpdateStructure({
+    required this.a,
+    required this.b,
+    required this.bLebLen,
+    required this.fieldCount,
+    required this.uuidMarker,
+    required this.uuid,
+    required this.vstampTagByte,
+    required this.vstamp,
+    required this.protoVerTagByte,
+    required this.protoVer,
+    required this.minProtoVerTagByte,
+    required this.minProtoVer,
+    required this.wptDataTagByte,
+    required this.memberLengthMarker,
+    required this.json,
+  });
+}
+
+/// Decodes the field-by-field structure of an add/update wire message —
+/// see [RouteCatalogConnection.addOrUpdateWaypoint]'s own doc comment for
+/// the full derivation. Every field is individually tagged
+/// `(fieldId << 3) | lebLen` (0-indexed on the wire): uuid=`07`(fieldId 0,
+/// overflow-length shape), vstamp=`0d`(fieldId 1), proto_ver=`11`(fieldId
+/// 2), min_proto_ver=`19`(fieldId 3), wpt_data=`27`(fieldId 4,
+/// overflow-length shape wrapping the gzip blob via the same
+/// `02 01 00 0f` marker the download side already uses).
+_AddOrUpdateStructure _decodeAddOrUpdateStructure(Uint8List rest) {
+  var off = _leb128Length(rest, 0);
+  off += 8; // prevRemoteVer
+  off += 8; // newRemoteVer
+  final tailLenLen = _leb128Length(rest, off);
+  off += tailLenLen;
+  final tail = Uint8List.sublistView(rest, off);
+
+  var o = 2; // fixed 01 07
+  final aLen = _leb128Length(tail, o);
+  final a = _leb128Value(tail, o);
+  o += aLen + 1; // + fixed 02
+  final bLen = _leb128Length(tail, o);
+  final b = _leb128Value(tail, o);
+  o += bLen;
+  final fieldCountLen = _leb128Length(tail, o);
+  final fieldCount = _leb128Value(tail, o);
+  o += fieldCountLen;
+  final uuidMarker = Uint8List.fromList(tail.sublist(o, o + 3));
+  o += 3;
+  final uuid = Uint8List.fromList(tail.sublist(o, o + 16));
+  o += 16;
+  final vstampTagByte = tail[o];
+  final vstampLen = _leb128Length(tail, o + 1);
+  final vstamp = _leb128Value(tail, o + 1);
+  o += 1 + vstampLen;
+  final protoVerTagByte = tail[o];
+  final protoVerLen = _leb128Length(tail, o + 1);
+  final protoVer = _leb128Value(tail, o + 1);
+  o += 1 + protoVerLen;
+  final minProtoVerTagByte = tail[o];
+  final minProtoVerLen = _leb128Length(tail, o + 1);
+  final minProtoVer = _leb128Value(tail, o + 1);
+  o += 1 + minProtoVerLen;
+  final wptDataTagByte = tail[o];
+  o += 1;
+  o += _leb128Length(tail, o); // wpt_data overflow-length (gzLen+8)
+  final memberLengthMarker = Uint8List.fromList(tail.sublist(o, o + 4));
+  o += 4;
+  o += _leb128Length(tail, o); // gzLen+2
+  final gzLenLen = _leb128Length(tail, o);
+  final gzLen = _leb128Value(tail, o);
+  o += gzLenLen;
+  final gzBlob = tail.sublist(o, o + gzLen);
+  var decompressed = GZipCodec().decode(gzBlob);
+  var end = decompressed.length;
+  while (end > 0 && decompressed[end - 1] == 0) {
+    end--;
+  }
+  final json = jsonDecode(utf8.decode(decompressed.sublist(0, end))) as Map<String, dynamic>;
+
+  return _AddOrUpdateStructure(
+    a: a,
+    b: b,
+    bLebLen: bLen,
+    fieldCount: fieldCount,
+    uuidMarker: uuidMarker,
+    uuid: uuid,
+    vstampTagByte: vstampTagByte,
+    vstamp: vstamp,
+    protoVerTagByte: protoVerTagByte,
+    protoVer: protoVer,
+    minProtoVerTagByte: minProtoVerTagByte,
+    minProtoVer: minProtoVer,
+    wptDataTagByte: wptDataTagByte,
+    memberLengthMarker: memberLengthMarker,
+    json: json,
+  );
 }

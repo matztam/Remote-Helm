@@ -937,7 +937,32 @@ class RouteCatalogConnection {
       ...correlationId,
     ]);
     _registeredTopics.add(topic);
+    // Stashed as [addOrUpdateWaypoint]'s `prevRemoteVer` source — see its
+    // own doc comment for why this (not a synced remote_ver, not a merge-
+    // priming batch download) is what a real create/update's version-stamp
+    // chain starts from when the topic hasn't already been synced on this
+    // connection: the one real capture that actually worked (two waypoints
+    // created back-to-back, `topicWaypoints` never synced at all
+    // beforehand) has its first create's `prevRemoteVer` byte-identical to
+    // this exact registration correlation id.
+    //
+    // **Deliberately a SEPARATE map from [_remoteVerByTopic]**: an earlier
+    // version stashed this into [_remoteVerByTopic] itself (via
+    // `putIfAbsent`), reasoning that a real sync's own result would always
+    // overwrite it when available. That broke [_ensureTopicReady] (used by
+    // [fetchObject]/[fetchObjects]), which decides whether to run a real
+    // [_syncCatalog] purely by checking whether [_remoteVerByTopic] already
+    // has an entry for the topic — this fallback value being present there
+    // made it skip that sync entirely, even though nothing had actually
+    // synced yet. [_remoteVerByTopic] must only ever contain real,
+    // server-confirmed values; this fallback lives in its own map instead,
+    // read only by [addOrUpdateWaypoint].
+    _registrationCorrelationIdByTopic.putIfAbsent(topic, () => correlationId);
   }
+
+  /// See [_registerTopic]'s doc comment for why this is a separate map
+  /// from [_remoteVerByTopic] rather than sharing it.
+  final Map<int, Uint8List> _registrationCorrelationIdByTopic = {};
 
   /// Registers every topic in [auxiliaryTopics] on this connection —
   /// **experimental, added 2026-08-09**. The real app always keeps a
@@ -1978,6 +2003,438 @@ class RouteCatalogConnection {
     // fresh live test, ideally checked from a *separate* later connection
     // (not this same method) after several minutes, the same way the
     // real app would only find out via its own next independent sync.
+  }
+
+  /// Creates or updates a single catalog entry (waypoint or route) on the
+  /// plotter — same dedicated message as [deleteEntry] (`tDeleteEntry`,
+  /// `0x02`; the plotter distinguishes add/update/delete purely by the
+  /// message body, not by a different `msgType`), fire-and-forget, no
+  /// reply.
+  ///
+  /// **Reverse-engineered 2026-08-11** from a real capture (`355eb949`) of
+  /// the official app creating a waypoint ("DYVIG") and a route
+  /// ("ANSTEUERUNG DYV") referencing it. Not yet live-tested against a real
+  /// plotter — see this method's own doc-comment history once that
+  /// happens.
+  ///
+  /// ### Wire format (tail, after the shared envelope described in
+  /// [deleteEntry]'s doc comment: self-referential outer length tag,
+  /// `prevRemoteVer`/`newRemoteVer`, LEB128 tail length)
+  /// ```
+  /// byte[0:2]    fixed `01 07`
+  /// bytes[2:]    a LEB128 vint `A`, then `02`, then a LEB128 vint `B` —
+  ///              **both self-referential byte offsets, not the
+  ///              `A=23+lebLen`/`B=21+lebLen` formula [deleteEntry]'s own
+  ///              trailer uses.** `B` is the exact byte distance from the
+  ///              END of this tail back to the start of the present-field-
+  ///              count byte below (i.e. `B = tail.length -
+  ///              offsetOfFieldCountByte`), solved the same way
+  ///              [_solveSelfReferentialLeb128Length] solves the outer tag
+  ///              (`B` incorporates its own LEB128 width). `A = B +
+  ///              lebLen(B) + 1` — confirmed exactly on both real
+  ///              messages (waypoint: A=236/B=233/lebLen(B)=2; route:
+  ///              A=781/B=778/lebLen(B)=2). [deleteEntry]'s own
+  ///              `A=23+lebLen`/`B=21+lebLen` formula is a coincidentally-
+  ///              linear special case of this same rule for a short
+  ///              (fieldCount ≤ 2) delete tail, not a separate mechanism —
+  ///              kept as-is there since it's already live-confirmed
+  ///              working and changing it isn't worth the risk.
+  /// next byte    present-field count (a plain byte here, `0x05` on both
+  ///              real captures — uuid + object-vstamp + 3 more framing
+  ///              fields the JSON blob itself covers, not decoded further
+  ///              field-by-field).
+  /// next 3 bytes fixed `07 11 10` — the mandatory uuid field's own
+  ///              tag/overflow-size/length prefix, identical to
+  ///              [deleteEntry]'s.
+  /// next 16      the object's own UUID (this client generates a fresh
+  ///              [_randomUuidBytes]-shaped one for a create; reuses
+  ///              the existing uuid for an update).
+  /// next 7       the object's OWN `vstamp` (not `del_vstamp` — no
+  ///              increment applied here), tagged `0x0d` + up to 6 LEB128
+  ///              payload bytes, zero-padded to a fixed 7-byte field —
+  ///              same tag/length convention as [_parseCatalogEntries]'s
+  ///              catalog-entry trailer. For a brand-new object (no prior
+  ///              vstamp), sent as `0d 00 00 00 00 00 00` — untested
+  ///              whether the plotter accepts a zero vstamp for a create;
+  ///              this is the most literal reading of "no known vstamp
+  ///              yet" and mirrors how [_buildDeleteTrailer] treats a null
+  ///              vstamp as an all-zero-length case, but needs live
+  ///              confirmation.
+  /// next 4       fixed marker `02 19 01 27`.
+  /// next N       `gzipBlobLength + 8` as a LEB128 vint, then the SAME
+  ///              `02 01 00 0f` [_memberLengthMarker] the download side's
+  ///              [_readMemberLengthFromHeader] already knows, then two
+  ///              more LEB128 vints — `gzipBlobLength + 2`, then the exact
+  ///              gzip blob length (the same "two LEB128 values, the
+  ///              second is the real length" shape that download-side
+  ///              header uses). Confirmed on both real captures
+  ///              (waypoint: 200/194/192; route: 745/739/737).
+  /// rest         the gzip-compressed JSON object body itself — BYTE-
+  ///              IDENTICAL shape to [fetchObject]'s reply JSON: `{"uuid",
+  ///              "proto_ver", "min_proto_ver", "vstamp", ...}` plus
+  ///              `"points"` (route) or `"lat"/"lon"` (waypoint). The real
+  ///              waypoint capture additionally had `"dspl_optn"`,
+  ///              `"depth"`, `"temp"`, `"mtime"`, `"comment"`, `"sym"`
+  ///              fields never seen in a download reply before — not
+  ///              required (untested which are optional), included here
+  ///              as sent as loosely as possible: only the fields this
+  ///              client actually has values for.
+  /// ```
+  ///
+  /// **⚠ SUPERSEDED 2026-08-11 — this whole `tDeleteEntry`-shaped wire
+  /// format above was never actually how the real app creates objects.**
+  /// Two live attempts sending exactly this (once with `vstamp: 0`, once
+  /// with a plausible non-zero `vstamp`, both after the same merge-priming
+  /// [deleteEntry] needs) both sent successfully but did nothing — the
+  /// catalog's entry count never changed. A fresh, purpose-made capture
+  /// (`34d945fa`, then a second confirming one, `342c2f35`) of the real
+  /// app creating actual new waypoints ("0001", then "0003") on a plotter
+  /// with a large existing catalog. That capture pair suggested creation
+  /// went through [tCatalogSync] instead — **also wrong**, or at least not
+  /// the ONLY mechanism: a third capture (`83d8898e`, two waypoints "0005"
+  /// and "0006" created back-to-back on a connection that never ran
+  /// [tCatalogSync] at all) showed BOTH new objects sent as ordinary
+  /// [tDeleteEntry]-shaped (`msgType 0x02`) messages, structurally
+  /// identical to the format documented above — live-confirmed on the
+  /// plotter both times. This whole doc-comment section (wire format
+  /// above) is therefore accurate after all; [addOrUpdateWaypoint]'s
+  /// remaining doc comment below covers the one real gap the two earlier,
+  /// failed live attempts actually had: `prevRemoteVer`.
+  ///
+  /// **A route's points are NOT embedded coordinates — they're UUID
+  /// references to separately-created waypoint objects**: the real
+  /// captured route's JSON has `"points": [{"lon":..., "lat":...,
+  /// "ref":{"class":"uwpt","uuid":"..."}}]`. Not yet implemented or
+  /// tested here.
+  ///
+  /// Creates or updates a waypoint on the plotter's catalog.
+  ///
+  /// **⚠ STATUS as of 2026-08-12: still not confirmed working live.** The
+  /// message this method sends is structurally byte-perfect against the
+  /// one real capture available of the official app creating a waypoint —
+  /// verified field-by-field, including a real wire-format bug found and
+  /// fixed this session (the object's own `vstamp` field must be a
+  /// variable-length tagged value, not padded to a fixed width). Multiple
+  /// `prevRemoteVer` sourcing strategies have been live-tested against the
+  /// real plotter: the registration-time correlation id (current
+  /// approach, matches the one real capture available), a freshly-synced
+  /// `remote_ver`, and [deleteEntry]'s own sync-then-batch-download
+  /// merge-priming sequence (in both a single unchunked batch and a
+  /// chunked variant) — **none of them produced a waypoint that
+  /// durably appeared in the plotter's catalog afterward**, even though
+  /// every attempt sent without any error or rejection from the plotter.
+  /// Also ruled out: send timing/delay after registration, keeping the
+  /// connection open vs. reconnecting for verification, and sending from
+  /// a fully HTTP-paired-and-authorized device identity (see
+  /// `credential.dart`'s `pair()`) instead of an unpaired connection.
+  /// **The real remaining difference from the working app is still
+  /// unknown.** Two promising, not-yet-analyzed real captures of the
+  /// official app creating multiple *routes* (not waypoints) back-to-back
+  /// exist and should be the next thing checked — routes might follow a
+  /// different, more completely-captured mechanism than the single
+  /// waypoint-creation capture this method is currently modeled on.
+  ///
+  /// **Reverse-engineered 2026-08-11**, across four real captures and
+  /// several live attempts. The wire format itself (this method's own
+  /// tail-building, shared with [deleteEntry] via [_buildAddOrUpdateBody])
+  /// was correct from early on — every earlier live failure was actually
+  /// **`prevRemoteVer`**, not the message shape:
+  ///
+  /// - The first two live attempts (`vstamp: 0`, then a plausible non-zero
+  ///   `vstamp`) both used a `prevRemoteVer` from a full, real
+  ///   [_fetchCatalog] sync — the same source [deleteEntry] uses on its
+  ///   own syncing path. Sent successfully, but the catalog never changed.
+  /// - **The real capture that finally worked (`83d8898e`) never
+  ///   synced `topicWaypoints` at all before its two creates.** Its first
+  ///   create's `prevRemoteVer` (`f04dd432f4020000`, `seq=756`) is
+  ///   BYTE-IDENTICAL to the correlation id `_registerTopic` sent when
+  ///   registering `topicWaypoints` moments earlier on the same
+  ///   connection — not a server-synced value at all, just this
+  ///   connection's own registration-time correlation id, reused. (The
+  ///   second create's `prevRemoteVer` then chains normally from the
+  ///   first's `newRemoteVer`, same as consecutive real deletes already
+  ///   documented.) [_registerTopic] now stashes that value into
+  ///   [_remoteVerByTopic] itself (see its own doc comment) specifically
+  ///   so this method — and any future caller needing a plausible
+  ///   `prevRemoteVer` without forcing a real sync — can read it back.
+  /// - A live-fetched `remote_ver` is real and server-confirmed, but
+  ///   apparently NOT what the plotter expects as the baseline for a
+  ///   brand-new object's version-stamp chain; the registration-time
+  ///   correlation id is. Exactly why is unconfirmed — plausibly the real
+  ///   app simply never bothers syncing before a create when it already
+  ///   has *some* locally-cached version-stamp-shaped value to start
+  ///   from, and the plotter accepts anything of the right shape as a
+  ///   starting point rather than validating it against server state.
+  ///
+  /// **The object's own `vstamp` — client-generated, `seq=2` on every
+  /// real create seen.** Four real captures' new-object vstamps all
+  /// decode as `(seq << 32) | sub` with `seq == 2` exactly (10728735544,
+  /// 9818661725, 10089107145, 11499009382 — four different `sub` values,
+  /// same `seq`), unrelated to the connection's per-topic `remote_ver`
+  /// `seq` (in the hundreds in the same captures) or to
+  /// [_incrementVstamp]'s delete-side `seq+1` scheme. A fifth, older
+  /// object seen only being UPDATED (not created) had `seq=3` —
+  /// consistent with `seq=2` being a real "first version" starting value
+  /// an update would increment from, though update support isn't
+  /// implemented here yet (this method always creates a fresh uuid,
+  /// ignoring [uuid] would need for reuse — see its own parameter doc).
+  /// `sub` is a fresh random 32-bit value, same shape as every other
+  /// vstamp/remote_ver `sub` field this file generates.
+  Future<String> addOrUpdateWaypoint(
+    String name,
+    double lat,
+    double lon, {
+    String? uuid,
+    Duration timeout = const Duration(seconds: 30),
+    // **Debug/investigation parameter, added 2026-08-11.** The real
+    // capture this method is modeled on waits ~15s after registering
+    // topicWaypoints/topicRoutes (with background keepalives ticking in
+    // between) before sending its first create — plausibly just real user
+    // interaction time (typing a name, picking a position) rather than
+    // anything the plotter's protocol itself requires, but every live
+    // attempt so far has sent immediately after registering and none has
+    // landed in the catalog. Lets a live test isolate whether this delay
+    // matters without changing the method's normal fire-immediately
+    // behavior for real callers.
+    Duration? debugDelayBeforeSend,
+  }) async {
+    await _ensurePreamble(timeout);
+    _registerTopic(topicWaypoints);
+    _registerTopic(topicRoutes);
+    if (debugDelayBeforeSend != null) {
+      await Future<void>.delayed(debugDelayBeforeSend);
+    }
+
+    final targetUuid = uuid ?? _formatUuid(_randomUuidBytes());
+    final random = Random();
+    final objectVstamp = (2 << 32) | random.nextInt(0x100000000);
+
+    // **Field set and order corrected 2026-08-11** after a live create
+    // with only the fields this client had direct values for (uuid,
+    // proto_ver, min_proto_ver, lat, lon, vstamp, name) sent successfully
+    // but didn't appear in the catalog afterward — every real create
+    // capture examined (three independent waypoints: "0001", "0003",
+    // "0005") includes SIX more fields in between, in this exact order,
+    // with `dspl_optn`/`sym` constant across all three: `dspl_optn: 19`,
+    // `depth: null`, `temp: null`, `mtime: <Garmin-epoch seconds>`,
+    // `comment: null`, `sym: 18`. Unconfirmed which (if any) are load-
+    // bearing vs. cosmetic, but sending the exact real shape rather than
+    // a guessed subset is the safer next thing to try.
+    final json = <String, dynamic>{
+      'uuid': targetUuid,
+      'proto_ver': 2,
+      'min_proto_ver': 1,
+      'lat': _toGarminSemicircle(lat),
+      'lon': _toGarminSemicircle(lon),
+      'dspl_optn': 19,
+      'depth': null,
+      'temp': null,
+      'mtime': _garminEpochSeconds(DateTime.now()),
+      'vstamp': objectVstamp,
+      'name': name,
+      'comment': null,
+      'sym': 18,
+    };
+
+    // **Aligned with [deleteEntry]'s own, live-confirmed-working mechanism
+    // — 2026-08-12, REVERTED same day.** [deleteEntry]'s sync+merge-
+    // priming mechanism was tried here on the theory that it's the
+    // "proven" pattern to follow — but the catalog (220 entries today) is
+    // larger than any size this mechanism has ever actually been
+    // confirmed working against (118 waypoints, 2026-08-08). A single
+    // full-catalog batch tGetObject gets no reply at all; chunking it
+    // does too — this file's own [fetchObjects] doc comment already
+    // documented on 2026-08-08 that "the plotter apparently cannot handle
+    // a second batch tGetObject on the same topic on the same connection,
+    // chunked or not", which this change briefly, mistakenly re-violated,
+    // reproducing the exact same lockout live. There is no real capture
+    // showing what the actual app does with a catalog this large, so
+    // neither "one big batch" nor "chunked batches" is validated at this
+    // scale — both are just guesses. Reverted to the registration-
+    // correlation-id method (still structurally byte-perfect against the
+    // real "0005" capture) to remove the batch download as a variable
+    // entirely while the real remaining difference from the actual app's
+    // behavior is still being tracked down.
+    final prevRemoteVer = _remoteVerByTopic[topicWaypoints] ?? _registrationCorrelationIdByTopic[topicWaypoints];
+    if (prevRemoteVer == null) {
+      throw RouteCatalogException('no remote_ver available for topicWaypoints — _registerTopic should have stashed one');
+    }
+    final newRemoteVer = _freshRemoteVerLikeValue(prevRemoteVer);
+    final body = _buildAddOrUpdateBody(
+      uuid: targetUuid,
+      vstamp: objectVstamp,
+      json: json,
+      prevRemoteVer: prevRemoteVer,
+      newRemoteVer: newRemoteVer,
+    );
+
+    _send(topicWaypoints, tDeleteEntry, 0, body);
+    _remoteVerByTopic[topicWaypoints] = newRemoteVer;
+    return targetUuid;
+  }
+
+  /// Builds the shared tail structure [addOrUpdateWaypoint] (and, once
+  /// implemented, a route-upload counterpart) uses — see
+  /// [addOrUpdateWaypoint]'s doc comment for the full field-by-field wire
+  /// format derivation.
+  List<int> _buildAddOrUpdateBody({
+    required String uuid,
+    required int vstamp,
+    required Map<String, dynamic> json,
+    required Uint8List prevRemoteVer,
+    required Uint8List newRemoteVer,
+  }) {
+    final gzipBlob = _gzipEncode(utf8.encode(jsonEncode(json)));
+    final vstampBytes = _buildAddOrUpdateVstampField(vstamp);
+    final uuidBytes = _parseUuid(uuid);
+
+    // **Corrected 2026-08-11** after the previous version's `02 19 01 27`
+    // "fixed marker" turned out to actually be TWO separate tagged fields
+    // this method was never sending on purpose — `proto_ver` (tag `0x11`)
+    // and `min_proto_ver` (tag `0x19`) — that happened to look like a fixed
+    // 4-byte marker only because this method's own hardcoded `proto_ver:
+    // 2, min_proto_ver: 1` JSON values are so small their LEB128 encoding
+    // is exactly one byte each, coincidentally matching the real capture's
+    // literal bytes even though the actual field boundaries were wrong. A
+    // fifth (envelope-level) present-field count of 5 covers: uuid,
+    // vstamp, proto_ver, min_proto_ver, and a nested nested-catalog-style
+    // "wpt_data" field wrapping the gzip blob — confirmed by decoding the
+    // real capture field-by-field with each field's own `(fieldId << 3) |
+    // lebLen`-shaped tag: uuid=`07`(fieldId 0, overflow), vstamp=`0d`
+    // (fieldId 1, lebLen 5), proto_ver=`11` (fieldId 2, lebLen 1),
+    // min_proto_ver=`19` (fieldId 3, lebLen 1), wpt_data=`27` (fieldId 4,
+    // overflow) — this message's fields are 0-indexed on the wire.
+    const presentFieldCount = 5;
+    final protoVerBytes = _buildAddOrUpdateTaggedIntField(fieldId: 2, value: (json['proto_ver'] as int));
+    final minProtoVerBytes = _buildAddOrUpdateTaggedIntField(fieldId: 3, value: (json['min_proto_ver'] as int));
+    // `wpt_data`'s own tag byte (`(4 << 3) | 7` — the same overflow-marker
+    // shape [uuid]'s own `07` tag uses), then a LEB128 overflow-length
+    // vint, then the SAME `02 01 00 0f` [_memberLengthMarker] the download
+    // side's [_readMemberLengthFromHeader] already knows, then two more
+    // LEB128 values — `gzLen+2`, then the exact `gzLen` — the same "two
+    // LEB128 values, the second is the real length" shape as that
+    // download-side header. Confirmed on every real create capture.
+    final wptDataOverflowLen = _encodeUnsignedLeb128(gzipBlob.length + 8);
+    final fieldTable = <int>[
+      presentFieldCount,
+      0x07, 0x11, 0x10, // uuid field tag/overflow-size/length prefix
+      ...uuidBytes,
+      ...vstampBytes,
+      ...protoVerBytes,
+      ...minProtoVerBytes,
+      (4 << 3) | 7,
+      ...wptDataOverflowLen,
+      ..._memberLengthMarker,
+      ..._encodeUnsignedLeb128(gzipBlob.length + 2),
+      ..._encodeUnsignedLeb128(gzipBlob.length),
+      ...gzipBlob,
+    ];
+
+    // B = self-referential byte-distance from the tail's own end back to
+    // fieldTable's start — see [addOrUpdateWaypoint]'s doc comment for
+    // why this isn't the same fixed formula [_rteDelMsgTagPrefix] uses.
+    // Solved the same fixed-point way [_solveSelfReferentialLeb128Length]
+    // solves the outer tag: `B`'s own LEB128 width is part of what it's
+    // counting.
+    final bEstimate = fieldTable.length + _encodeUnsignedLeb128(fieldTable.length).length;
+    final b = _solveSelfReferentialLeb128Length(bEstimate);
+    final bBytes = _encodeUnsignedLeb128(b);
+    final a = b + bBytes.length + 1;
+
+    final tail = <int>[
+      0x01, 0x07,
+      ..._encodeUnsignedLeb128(a),
+      0x02,
+      ...bBytes,
+      ...fieldTable,
+    ];
+    final tailLenBytes = _encodeUnsignedLeb128(tail.length);
+    final restAfterTag = <int>[
+      ...prevRemoteVer,
+      ...newRemoteVer,
+      ...tailLenBytes,
+      ...tail,
+    ];
+    final totalLengthEstimate = restAfterTag.length + _encodeUnsignedLeb128(restAfterTag.length).length;
+    final tagValue = _solveSelfReferentialLeb128Length(totalLengthEstimate);
+    return <int>[
+      ..._encodeUnsignedLeb128(tagValue),
+      ...restAfterTag,
+    ];
+  }
+
+  /// The object-own-`vstamp` field: same tagged-field convention as
+  /// [_buildAddOrUpdateTaggedIntField] — tag byte `(fieldId << 3) |
+  /// lebLen` followed by [vstamp]'s own unsigned LEB128 encoding at
+  /// whatever width it naturally takes, no padding. `vstamp` is
+  /// field 1, so the tag is `0x08 | lebLen`. Unlike [_buildDeleteTrailer]'s
+  /// `del_vstamp`, this is NOT incremented — it's the object's own
+  /// current/starting vstamp verbatim.
+  List<int> _buildAddOrUpdateVstampField(int vstamp) {
+    // _encodeUnsignedLeb128 assumes a non-negative value and loops forever
+    // on a negative one (right-shifting a negative Dart int sign-extends,
+    // so it never reaches zero) — caught live 2026-08-11 when a caller
+    // passed a `(seq << 32) | sub` vstamp whose `seq` alone was large
+    // enough to overflow into bit 63, silently producing a negative
+    // 64-bit int and hanging mid-send instead of failing cleanly.
+    if (vstamp < 0) {
+      throw RouteCatalogException('vstamp $vstamp is negative — likely an overflowed (seq << 32) | sub construction');
+    }
+    return _buildAddOrUpdateTaggedIntField(fieldId: 1, value: vstamp);
+  }
+
+  /// Builds a small tagged integer field — tag byte `(fieldId << 3) |
+  /// lebLen`, same convention every other field tag in this message uses
+  /// (see [_buildAddOrUpdateVstampField]'s doc comment for the general
+  /// shape), followed by [value]'s own unsigned LEB128 encoding at
+  /// whatever width it naturally takes (no fixed-width padding, unlike
+  /// the vstamp field). Used for `proto_ver`/`min_proto_ver`, which are
+  /// always small values (1-2 in every real capture) — this throws if
+  /// [value] ever needs more than 1 LEB128 byte, since a `lebLen` above 7
+  /// would collide with the "overflow, size given separately" marker
+  /// shape [uuid]'s own tag uses, which this simple helper doesn't
+  /// implement.
+  List<int> _buildAddOrUpdateTaggedIntField({required int fieldId, required int value}) {
+    final varint = _encodeUnsignedLeb128(value);
+    if (varint.length > 6) {
+      throw RouteCatalogException('value $value for field $fieldId needs a longer encoding than this helper supports');
+    }
+    return <int>[(fieldId << 3) | varint.length, ...varint];
+  }
+
+  /// A fresh random 16-byte value for a newly-created object's own uuid —
+  /// same shape as `route_sync.dart`'s per-waypoint uuid (this file has no
+  /// dependency on that one beyond the shared [RoutePoint] type, so it's
+  /// not reused directly).
+  static Uint8List _randomUuidBytes() {
+    final rnd = Random();
+    return Uint8List.fromList(List<int>.generate(16, (_) => rnd.nextInt(256)));
+  }
+
+  /// Converts plain degrees to Garmin's semicircle `int32` encoding — same
+  /// formula as `route_sync.dart`'s `_toSemicircle`, duplicated here since
+  /// this file has no dependency on that one beyond the shared
+  /// [RoutePoint] type (see this file's `export` statement).
+  static int _toGarminSemicircle(double degrees) {
+    const scale = 2147483648.0 / 180.0; // 2^31 / 180
+    return (degrees * scale).round();
+  }
+
+  /// Converts [time] to seconds since the Garmin/GPS epoch
+  /// (1989-12-31T00:00:00Z) — same formula as `route_sync.dart`'s
+  /// `_waypointMetadataBlock`/`_garminEpochOffsetSeconds`, duplicated here
+  /// for the same reason [_toGarminSemicircle] is.
+  static int _garminEpochSeconds(DateTime time) {
+    final garminEpoch = DateTime.utc(1989, 12, 31).millisecondsSinceEpoch ~/ 1000;
+    return time.toUtc().millisecondsSinceEpoch ~/ 1000 - garminEpoch;
+  }
+
+  /// gzip-compresses [data] the same way the plotter's own object payloads
+  /// are compressed — confirmed round-trippable against both real
+  /// captured objects' JSON via [GZipCodec] (Dart's standard zlib-backed
+  /// implementation), not a custom encoder.
+  static Uint8List _gzipEncode(List<int> data) {
+    return Uint8List.fromList(GZipCodec().encode(data));
   }
 
   /// **Diagnostic only, added 2026-08-09** — sends an arbitrary
