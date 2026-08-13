@@ -2303,13 +2303,27 @@ class RouteCatalogConnection {
     // plausibly fail
     // during a long-lived test session with multiple prior writes: the
     // cached value goes stale and the plotter silently drops a write
-    // built on a stale `prevRemoteVer`. Syncing immediately before every
-    // add/update — without the merge-completion batch download
-    // [deleteEntry] additionally needs — always produces a current value
-    // regardless of which case applies, at the cost of one extra
-    // round-trip per call.
-    final sync = await _fetchCatalog(topicWaypoints, timeout: timeout);
-    final prevRemoteVer = sync.remoteVer;
+    // built on a stale `prevRemoteVer`.
+    //
+    // **No longer unconditionally re-syncs — fixed 2026-08-13.** This
+    // used to always call [_fetchCatalog] here, on the theory that doing
+    // so right before every add/update always produces a current value
+    // regardless of caching. That was true in isolation, but wrong once
+    // this connection could be long-lived and shared (see
+    // [RouteCatalogService]): a SECOND [tCatalogSync] on a topic this
+    // same connection had already synced was found live to be its own
+    // reliability risk — the exact same "no reply"/reset-connection
+    // failure mode already documented on [_syncCatalog]/[fetchObjects]'
+    // own doc comments for two batch downloads on one connection,
+    // generalized to two plain syncs. [_remoteVerByTopic] already holds
+    // the most recently known value for this topic on this connection —
+    // from [_registerTopic]'s own correlation id if nothing else has
+    // touched it yet, from a real sync if [RouteCatalogService] (or any
+    // other caller) already ran one, or from this method's own previous
+    // call if this is a second write in a row — so a fresh sync here is
+    // only actually needed the first time this topic is touched at all
+    // on this connection.
+    final prevRemoteVer = _remoteVerByTopic[topicWaypoints] ?? (await _fetchCatalog(topicWaypoints, timeout: timeout)).remoteVer;
     final newRemoteVer = _freshRemoteVerLikeValue(prevRemoteVer);
     final body = _buildAddOrUpdateBody(
       uuid: targetUuid,
@@ -2378,10 +2392,10 @@ class RouteCatalogConnection {
       ],
     };
 
-    // See [addOrUpdateWaypoint]'s doc comment for why this always syncs
-    // immediately before sending rather than trusting a cached remote_ver.
-    final sync = await _fetchCatalog(topicRoutes, timeout: timeout);
-    final prevRemoteVer = sync.remoteVer;
+    // See [addOrUpdateWaypoint]'s doc comment for why this only syncs
+    // when this connection doesn't already have a cached remote_ver for
+    // the topic, rather than unconditionally re-syncing.
+    final prevRemoteVer = _remoteVerByTopic[topicRoutes] ?? (await _fetchCatalog(topicRoutes, timeout: timeout)).remoteVer;
     final newRemoteVer = _freshRemoteVerLikeValue(prevRemoteVer);
     final body = _buildAddOrUpdateBody(
       uuid: targetUuid,
