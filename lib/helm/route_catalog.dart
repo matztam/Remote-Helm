@@ -457,6 +457,25 @@ class RouteCatalogException implements Exception {
   String toString() => 'route catalog: $message';
 }
 
+/// A catalog change the plotter pushed to this connection on its own,
+/// without this client having asked — see [RouteCatalogConnection.pushes]'
+/// doc comment for the full background. Either an add/update (carries the
+/// full [DownloadedObject]) or a delete (carries only the removed uuid).
+sealed class CatalogPush {
+  final int topic;
+  const CatalogPush(this.topic);
+}
+
+class CatalogPushUpdate extends CatalogPush {
+  final DownloadedObject object;
+  const CatalogPushUpdate(super.topic, this.object);
+}
+
+class CatalogPushDelete extends CatalogPush {
+  final String uuid;
+  const CatalogPushDelete(super.topic, this.uuid);
+}
+
 /// Builds one outer `MSG*` frame: `[MSG*][u32 LE length][payload]`.
 Uint8List _buildMsgFrame(List<int> payload) {
   final out = Uint8List(8 + payload.length);
@@ -595,6 +614,47 @@ class RouteCatalogConnection {
   /// [fetchObject] call is currently queued/in-flight for that topic.
   final Map<int, Future<void>> _getObjectQueueByTopic = {};
 
+  /// Catalog changes the plotter pushed to this connection unprompted —
+  /// see [pushes]' own doc comment.
+  final StreamController<CatalogPush> _pushes = StreamController.broadcast();
+
+  /// **Reverse-engineered 2026-08-13** from a real capture (`0b32f738`) of
+  /// the official app with a `RouteCatalogConnection`-equivalent
+  /// connection already open while a route was drawn directly on the
+  /// plotter's own screen (not through any app at all): the plotter sent
+  /// a fresh `msgType=0x2` message on `topicRoutes` — the exact same wire
+  /// shape [addOrUpdateWaypoint]/[addOrUpdateRoute] send, just in the
+  /// opposite direction — **on its own initiative, with no request from
+  /// this connection at all**, once for every incremental change (each
+  /// new point added, then again for the final rename): six messages
+  /// total for one route, all sharing one uuid with cleanly chained
+  /// `prevRemoteVer`/`newRemoteVer` pairs, exactly like a client's own
+  /// sequential writes would.
+  ///
+  /// **This is the real mechanism behind how the official app stays in
+  /// sync without ever re-querying the plotter** — see this file's top
+  /// doc comment and the memory system's investigation notes for the
+  /// full trail: multiple real captures independently confirmed the app
+  /// never sends a second [tCatalogSync] on a topic after its first one
+  /// per connection, no matter how long it stays open or how many
+  /// changes happen (its own writes AND changes made directly on the
+  /// plotter, outside the app entirely, both showed up this way). A
+  /// second sync attempted by this client to "catch up" after a write —
+  /// even on a brand-new connection — was found live to be unreliable at
+  /// this catalog's size (see `deleteEntry`'s connection-reuse notes and
+  /// the memory system's `plotter-timeout-lockout` history for the
+  /// pattern). Listening here instead of re-syncing is not just closer to
+  /// the real app's behavior; it's the only approach confirmed not to
+  /// risk that failure mode.
+  ///
+  /// Fires one [CatalogPushUpdate] (full object, from the same gzip+JSON
+  /// shape [fetchObject]'s reply uses) per incoming add/update, or one
+  /// [CatalogPushDelete] (uuid only) per incoming delete — distinguished
+  /// by whether the message has a gzip payload at all, the same way
+  /// [deleteEntry]'s own wire format lacks one. Never closes on its own;
+  /// closes when this connection does ([close]).
+  Stream<CatalogPush> get pushes => _pushes.stream;
+
   RouteCatalogConnection._(this._socket) {
     _sub = _socket.listen(
       (chunk) {
@@ -613,6 +673,14 @@ class RouteCatalogConnection {
             print('DEBUG parsed msg topic=0x${m.topicId.toRadixString(16)} type=0x${m.msgType.toRadixString(16)} len=${m.rest.length}');
           }
           _messages.add(m);
+          // Every message on [_messages] is something the PLOTTER sent —
+          // this client's own sends never loop back through this stream —
+          // so any `tDeleteEntry`-shaped (msgType 0x02) message here is
+          // necessarily plotter-initiated, never an echo of this client's
+          // own addOrUpdateWaypoint/addOrUpdateRoute/deleteEntry call.
+          if (m.msgType == tDeleteEntry) {
+            _handleIncomingPush(m);
+          }
         }
       },
       onError: (Object e) {
@@ -3259,11 +3327,45 @@ class RouteCatalogConnection {
     return reply;
   }
 
+  /// Decodes an incoming plotter-initiated `tDeleteEntry`-shaped message
+  /// (see [pushes]' own doc comment) into a [CatalogPush] and adds it to
+  /// [_pushes]. Deliberately reuses [_findBytes]-based landmark search
+  /// (the uuid marker, the gzip magic) rather than re-deriving the exact
+  /// field-by-field tag layout [_buildAddOrUpdateBody]/[_buildDeleteTrailer]
+  /// build — this is parsing a message this client didn't construct, so
+  /// trusting the same landmarks the send side already relies on is safer
+  /// than assuming the receive side's layout is byte-identical to what
+  /// this client happens to send.
+  void _handleIncomingPush(_InnerMessage message) {
+    final uuidMarkerIdx = _findBytes(message.rest, const [0x07, 0x11, 0x10]);
+    if (uuidMarkerIdx < 0 || uuidMarkerIdx + 3 + 16 > message.rest.length) {
+      // Not a shape this client recognizes -- silently ignored rather than
+      // thrown, since a malformed/unexpected push shouldn't take down an
+      // otherwise-healthy connection over something this client doesn't
+      // strictly need to understand.
+      return;
+    }
+    final uuid = _formatUuid(Uint8List.sublistView(message.rest, uuidMarkerIdx + 3, uuidMarkerIdx + 3 + 16));
+
+    final gzipIdx = _findBytes(message.rest, const [0x1F, 0x8B, 0x08]);
+    if (gzipIdx < 0) {
+      // No JSON payload at all -- the same shape deleteEntry's own
+      // fire-and-forget delete uses, just arriving in the other direction.
+      _pushes.add(CatalogPushDelete(message.topicId, uuid));
+      return;
+    }
+    final object = _decodePushObjectJson(Uint8List.sublistView(message.rest, gzipIdx), fallbackUuid: uuid);
+    if (object != null) {
+      _pushes.add(CatalogPushUpdate(message.topicId, object));
+    }
+  }
+
   Future<void> close() async {
     _keepaliveTimer?.cancel();
     await _appMsgReplySub?.cancel();
     await _sub.cancel();
     await _messages.close();
+    await _pushes.close();
     _socket.destroy();
   }
 }
@@ -3334,6 +3436,54 @@ DownloadedObject _decodeObjectJson(Uint8List gzipBytes, {required String fallbac
   }
   if (points.isEmpty) {
     throw const RouteCatalogException('object reply had no usable coordinates');
+  }
+
+  return DownloadedObject(
+    name: name,
+    uuid: json['uuid'] as String? ?? fallbackUuid,
+    points: points,
+    vstamp: (json['vstamp'] as num?)?.toInt(),
+  );
+}
+
+/// Like [_decodeObjectJson], but for [RouteCatalogConnection.pushes]:
+/// **allows an empty `points` list** rather than throwing. A real capture
+/// (`0b32f738`) showed the plotter push a brand-new route with `"points":
+/// []` the moment it's created on the plotter's own screen, before the
+/// user has drawn any points yet — a real, valid intermediate state for a
+/// push (unlike [fetchObject]'s reply, which only ever describes an
+/// already-fully-formed object, where no usable coordinates really does
+/// mean something went wrong). Returns `null` instead of throwing on a
+/// genuinely undecodable payload, since one malformed push shouldn't be
+/// allowed to crash an otherwise-healthy [pushes] listener.
+DownloadedObject? _decodePushObjectJson(Uint8List gzipBytes, {required String fallbackUuid}) {
+  final Map<String, dynamic> json;
+  try {
+    final decompressed = GZipCodec().decode(gzipBytes);
+    var jsonBytes = decompressed;
+    var end = jsonBytes.length;
+    while (end > 0 && jsonBytes[end - 1] == 0) {
+      end--;
+    }
+    json = jsonDecode(utf8.decode(jsonBytes.sublist(0, end))) as Map<String, dynamic>;
+  } on Object {
+    return null;
+  }
+
+  final name = (json['name'] ?? json['id']) as String? ?? fallbackUuid;
+  final points = <RoutePoint>[];
+  final rawPoints = json['points'];
+  if (rawPoints is List) {
+    for (final p in rawPoints) {
+      final map = p as Map<String, dynamic>;
+      final lon = (map['lon'] as num).toInt();
+      final lat = (map['lat'] as num).toInt();
+      points.add(RoutePoint(name: name, lat: _fromSemicircle(lat), lon: _fromSemicircle(lon)));
+    }
+  } else if (json['lon'] is num && json['lat'] is num) {
+    final lon = (json['lon'] as num).toInt();
+    final lat = (json['lat'] as num).toInt();
+    points.add(RoutePoint(name: name, lat: _fromSemicircle(lat), lon: _fromSemicircle(lon)));
   }
 
   return DownloadedObject(

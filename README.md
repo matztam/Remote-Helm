@@ -63,14 +63,21 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   reverse direction of the import above, over a completely separate
   channel (see `lib/helm/route_catalog.dart`). Confirmed working live
   end-to-end.
-- **Creating/updating waypoints and routes directly on the plotter**
+- **Creating/updating routes and waypoints directly on the plotter**
   (`lib/helm/route_catalog.dart`'s `addOrUpdateWaypoint`/
-  `addOrUpdateRoute`): confirmed working live — a created waypoint and a
-  created route have both been independently verified present in the
-  plotter's own catalog afterward, without the extra per-point waypoint
-  clutter the official app itself creates for routes. Not yet exposed in
-  the UI. See those methods' own doc comments for the full derivation and
-  a known rough edge around repeated calls against a large catalog.
+  `addOrUpdateRoute`): confirmed working live, and wired into the GPX
+  import flow — importing a `.gpx` route saves it durably to the
+  plotter's own catalog (not just an ephemeral active-navigation push),
+  without the extra per-point waypoint clutter the official app itself
+  creates for routes. An optional checkbox in the import dialog also
+  starts active navigation on it immediately, same as the original
+  import mechanism always did. See `RouteCatalogService`
+  (`lib/ui/route_catalog_service.dart`) for how the app stays in sync
+  with the plotter's catalog after that: one sync when it connects, then
+  living entirely off the plotter's own unprompted push notifications
+  for anything that changes afterward — the same thing the real
+  ActiveCaptain app does, and the only approach found reliable against a
+  large (200+ entry) catalog.
 
 ## Requirements
 

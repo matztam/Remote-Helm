@@ -2,46 +2,29 @@
 /// in three tabs, letting the user pick one to save (as a `.gpx` file) or
 /// share (via the platform share sheet).
 ///
-/// **Fetches each topic's real objects in one batch call per topic**
-/// ([RouteCatalogConnection.fetchCatalog] then [RouteCatalogConnection.
-/// fetchObjects]), not lazily per row. An earlier version of this dialog
-/// fetched lazily (one [RouteCatalogConnection.fetchObject] call per row,
-/// as it scrolled into view) after batch-downloading everything up front
-/// repeatedly tripped the real plotter's protective lockout — but that
-/// turned out to be caused by two separate, now-fixed bugs, not by
-/// batching itself:
+/// **Reads from [RouteCatalogService]'s already-loaded local catalog
+/// copy — does not sync anything itself, ever, including on open.**
+/// An earlier version of this dialog opened its own
+/// [RouteCatalogConnection] and ran a fresh [RouteCatalogConnection.
+/// fetchCatalog]/[RouteCatalogConnection.fetchObjects] pair per topic
+/// every time it opened. That was already an improvement over an even
+/// earlier per-row-lazy-fetch version (see git history for that trail),
+/// but was itself found live to be a reliability risk: opening this
+/// dialog shortly after a write (e.g. right after importing a route)
+/// could trigger the same "second sync on/around an already-synced
+/// topic" failure mode [RouteCatalogService]'s own top doc comment
+/// describes in detail — up to and including the plotter resetting the
+/// TCP connection outright. Reading from [RouteCatalogService]'s
+/// continuously-updated local copy instead means this dialog never
+/// triggers a sync of its own, no matter when it's opened relative to a
+/// recent write.
 ///
-/// 1. **The catalog can list more raw entries than are real, individually
-///    fetchable objects** — [RouteCatalogConnection.fetchCatalog] used to
-///    return every raw record it found, but the plotter's own sync reply
-///    carries a "real object count" field this library now decodes and
-///    trims to (see `route_catalog.dart`'s [RouteCatalogConnection._syncCatalog]
-///    doc comment). Asking for one of the non-real entries got no reply at
-///    all from the plotter, which is what actually caused the lockouts —
-///    not the batch size.
-/// 2. **Client-side chunking of large batches was itself broken** — it used
-///    to split >100-uuid requests into multiple sequential batch calls,
-///    but the real app never does that (it always sends every uuid it
-///    wants in one request), and the chunking's own re-sync step got no
-///    reply, live, every time. Chunking has been removed.
-///
-/// With both fixed, a single [RouteCatalogConnection.fetchCatalog] +
-/// [RouteCatalogConnection.fetchObjects] pair per topic is exactly what
-/// the real app does, and has been confirmed live to reliably fetch the
-/// plotter's entire real routes catalog (75, then 74 after a live
-/// deletion), full waypoints catalog (118), and the saved track (5000
-/// points) — see the memory system's `plotter-timeout-lockout` note for
-/// the full investigation trail.
-///
-/// **Each tab loads independently** (its own connection-shared
-/// [RouteCatalogConnection], its own [FutureBuilder] chain) so a slow or
-/// failing topic doesn't block the others — switching to the Waypoints tab
-/// while Routes is still loading works. [RouteCatalogConnection.
-/// fetchObjects] itself decodes the batch reply (gzip inflate + JSON parse
-/// + point-building for every object) on a background isolate, not this
-/// widget's own event loop — live-observed necessary: decoding the
-/// track's single ~367KB/5000-point object synchronously took long enough
-/// that the OS flagged the whole app as "not responding".
+/// [RouteCatalogService] keeps its local copy live via the plotter's own
+/// unprompted push messages ([RouteCatalogConnection.pushes]) — so this
+/// dialog updates in real time if the catalog changes while it's open
+/// (a delete elsewhere in the app, a change made directly on the
+/// plotter, or another app's write), via [AnimatedBuilder]/
+/// [ListenableBuilder] on the shared [RouteCatalogService].
 library;
 
 import 'dart:convert';
@@ -55,61 +38,22 @@ import 'package:share_plus/share_plus.dart';
 
 import '../helm/gpx.dart';
 import '../helm/route_catalog.dart';
+import 'route_catalog_service.dart';
 
-/// Shows the catalog browser dialog for [host]. Fire-and-forget from the
-/// caller's perspective — all success/error feedback happens via
-/// [ScaffoldMessenger] inside the dialog itself.
-Future<void> showRouteCatalogDialog(BuildContext context, String host) {
+/// Shows the catalog browser dialog, reading from [service]'s local
+/// catalog copy. Fire-and-forget from the caller's perspective — all
+/// success/error feedback happens via [ScaffoldMessenger] inside the
+/// dialog itself.
+Future<void> showRouteCatalogDialog(BuildContext context, RouteCatalogService service) {
   return showDialog<void>(
     context: context,
-    builder: (context) => RouteCatalogDialog(host: host),
+    builder: (context) => RouteCatalogDialog(service: service),
   );
 }
 
-class RouteCatalogDialog extends StatefulWidget {
-  final String host;
-  const RouteCatalogDialog({super.key, required this.host});
-
-  @override
-  State<RouteCatalogDialog> createState() => _RouteCatalogDialogState();
-}
-
-class _RouteCatalogDialogState extends State<RouteCatalogDialog> {
-  Future<RouteCatalogConnection>? _connFuture;
-
-  /// Serializes every tab's load onto this one queue, so only one topic is
-  /// ever being fetched at a time on the shared connection — all three
-  /// tabs start loading as soon as the dialog opens (not just the visible
-  /// one), but each [_TopicList.load] call chains onto whatever the
-  /// previous one left here instead of running concurrently. Live testing
-  /// this session found the underlying protocol doesn't handle concurrent
-  /// requests on one connection well even across different topics — see
-  /// `route_catalog.dart`'s `_syncInFlightByTopic`/`_getObjectQueueByTopic`
-  /// doc comments for the same lesson learned the hard way for
-  /// single-object fetches; this is the same idea one level up, for the
-  /// catalog+batch-fetch pair each tab runs.
-  Future<void> _loadQueue = Future<void>.value();
-
-  /// Runs [load] only after every earlier-queued tab's own load has
-  /// finished (successfully or not) — see [_loadQueue]'s doc comment.
-  Future<T> _enqueueLoad<T>(Future<T> Function() load) {
-    final previous = _loadQueue;
-    final result = previous.then((_) => load());
-    _loadQueue = result.then((_) {}, onError: (_) {});
-    return result;
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _connFuture = RouteCatalogConnection.connect(widget.host);
-  }
-
-  @override
-  void dispose() {
-    _connFuture?.then((c) => c.close());
-    super.dispose();
-  }
+class RouteCatalogDialog extends StatelessWidget {
+  final RouteCatalogService service;
+  const RouteCatalogDialog({super.key, required this.service});
 
   @override
   Widget build(BuildContext context) {
@@ -118,16 +62,22 @@ class _RouteCatalogDialogState extends State<RouteCatalogDialog> {
       content: SizedBox(
         width: 420,
         height: 460,
-        child: FutureBuilder<RouteCatalogConnection>(
-          future: _connFuture,
-          builder: (context, connSnapshot) {
-            if (connSnapshot.connectionState != ConnectionState.done) {
-              return const Center(child: CircularProgressIndicator());
+        child: ListenableBuilder(
+          listenable: service,
+          builder: (context, _) {
+            if (!service.isReady) {
+              return Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    const SizedBox(height: 12),
+                    Text(service.statusMessage ?? 'Loading…'),
+                  ],
+                ),
+              );
             }
-            if (connSnapshot.hasError) {
-              return Center(child: Text('Could not connect: ${connSnapshot.error}'));
-            }
-            return _CatalogTabs(conn: connSnapshot.data!, enqueueLoad: _enqueueLoad);
+            return _CatalogTabs(service: service);
           },
         ),
       ),
@@ -150,9 +100,8 @@ class _RouteCatalogDialogState extends State<RouteCatalogDialog> {
 /// passes that down as a flag, rather than each [_TopicList] deciding for
 /// itself when to start.
 class _CatalogTabs extends StatefulWidget {
-  final RouteCatalogConnection conn;
-  final Future<T> Function<T>(Future<T> Function() load) enqueueLoad;
-  const _CatalogTabs({required this.conn, required this.enqueueLoad});
+  final RouteCatalogService service;
+  const _CatalogTabs({required this.service});
 
   @override
   State<_CatalogTabs> createState() => _CatalogTabsState();
@@ -160,18 +109,11 @@ class _CatalogTabs extends StatefulWidget {
 
 class _CatalogTabsState extends State<_CatalogTabs> with SingleTickerProviderStateMixin {
   late final TabController _tabController;
-  final _visited = {0}; // tab 0 (Routes) is visible from the start
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
-    _tabController.addListener(() {
-      // .index changes as soon as a swipe/tap lands on a new tab, ahead of
-      // the switch animation finishing — good enough to start that tab's
-      // own load a little early rather than waiting for the animation.
-      if (_visited.add(_tabController.index)) setState(() {});
-    });
   }
 
   @override
@@ -197,28 +139,22 @@ class _CatalogTabsState extends State<_CatalogTabs> with SingleTickerProviderSta
             controller: _tabController,
             children: [
               _TopicList(
-                conn: widget.conn,
+                service: widget.service,
                 topic: topicRoutes,
                 icon: Icons.route,
                 label: 'Route',
-                enqueueLoad: widget.enqueueLoad,
-                startLoading: _visited.contains(0),
               ),
               _TopicList(
-                conn: widget.conn,
+                service: widget.service,
                 topic: topicWaypoints,
                 icon: Icons.location_on,
                 label: 'Waypoint',
-                enqueueLoad: widget.enqueueLoad,
-                startLoading: _visited.contains(1),
               ),
               _TopicList(
-                conn: widget.conn,
+                service: widget.service,
                 topic: topicTrack,
                 icon: Icons.timeline,
                 label: 'Track',
-                enqueueLoad: widget.enqueueLoad,
-                startLoading: _visited.contains(2),
               ),
             ],
           ),
@@ -228,67 +164,24 @@ class _CatalogTabsState extends State<_CatalogTabs> with SingleTickerProviderSta
   }
 }
 
-/// One tab's contents: loads [topic]'s catalog, then its objects, showing
-/// real load progress at each stage rather than just a spinner throughout.
+/// One tab's contents: reads directly from [service]'s already-loaded
+/// local copy of [topic]'s catalog — never fetches anything itself, and
+/// stays live-updated via [service]'s own [ChangeNotifier] notifications
+/// (fed by [RouteCatalogConnection.pushes] — see this file's own top doc
+/// comment).
 class _TopicList extends StatefulWidget {
-  final RouteCatalogConnection conn;
+  final RouteCatalogService service;
   final int topic;
   final IconData icon;
   final String label;
-  final Future<T> Function<T>(Future<T> Function() load) enqueueLoad;
 
-  /// Whether this tab should have started loading yet — `false` for a tab
-  /// the user hasn't looked at. Found live 2026-08-07: all three tabs used
-  /// to call [RouteCatalogConnection.fetchCatalog] as soon as the dialog
-  /// opened, all sharing one queue (see [_RouteCatalogDialogState.
-  /// _loadQueue]) so only one topic is ever mid-fetch at a time — but that
-  /// meant the *visible* tab could be stuck showing "Connecting…" for as
-  /// long as whichever other, invisible tab happened to be ahead of it in
-  /// the queue, which is confusing (it's not actually still connecting,
-  /// just waiting its turn behind something the user isn't even looking
-  /// at). Now only the tab(s) the user has actually visited start loading
-  /// at all — see [_CatalogTabsState._visited].
-  final bool startLoading;
-
-  const _TopicList({
-    required this.conn,
-    required this.topic,
-    required this.icon,
-    required this.label,
-    required this.enqueueLoad,
-    required this.startLoading,
-  });
+  const _TopicList({required this.service, required this.topic, required this.icon, required this.label});
 
   @override
   State<_TopicList> createState() => _TopicListState();
 }
 
-/// What stage this tab's load is at, for the progress UI — see
-/// [_TopicListState._load].
-sealed class _LoadState {
-  const _LoadState();
-}
-
-class _Loading extends _LoadState {
-  /// `null` until the catalog sync itself has returned, so the UI can show
-  /// "connecting…" first, then "N found, loading…" once a real count is
-  /// known.
-  final int? total;
-  const _Loading(this.total);
-}
-
-class _Loaded extends _LoadState {
-  final List<DownloadedObject> objects;
-  const _Loaded(this.objects);
-}
-
-class _Failed extends _LoadState {
-  final Object error;
-  const _Failed(this.error);
-}
-
 class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMixin {
-  _LoadState _state = const _Loading(null);
   final _busyUuids = <String>{};
   final _searchController = TextEditingController();
   String _query = '';
@@ -302,33 +195,21 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
   final _selectedUuids = <String>{};
   bool _bulkDeleting = false;
 
-  // Without this, TabBarView disposes each tab's State (and its cached
-  // _state/_busyUuids) as soon as it scrolls off-screen, so switching back
-  // to an already-loaded tab re-ran initState -> _load() and re-fetched
-  // from the plotter every time — reported live 2026-08-07. Keeping this
-  // tab's State alive for the dialog's lifetime, not just while visible,
-  // fixes that: _load() only ever runs once per tab per dialog open.
+  // No fetching happens per-tab anymore (see this class' own doc
+  // comment), but TabBarView still disposes non-kept-alive tabs' State
+  // when they scroll off-screen, which would otherwise drop
+  // _selectedUuids/_selecting/_searchController's text on every tab
+  // switch — kept alive so that in-progress selection/search state
+  // survives switching tabs and back, same as before.
   @override
   bool get wantKeepAlive => true;
-
-  bool _started = false;
 
   @override
   void initState() {
     super.initState();
-    if (widget.startLoading) _startLoad();
     _searchController.addListener(() {
       setState(() => _query = _searchController.text.trim().toLowerCase());
     });
-  }
-
-  @override
-  void didUpdateWidget(_TopicList oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Starts the load the moment this tab is actually visited (see
-    // [_TopicList.startLoading]'s doc comment) — [_CatalogTabsState]
-    // flips this true and rebuilds once the user switches to this tab.
-    if (widget.startLoading && !_started) _startLoad();
   }
 
   @override
@@ -337,74 +218,22 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
     super.dispose();
   }
 
-  void _startLoad() {
-    _started = true;
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      // Queued (see [_RouteCatalogDialogState._loadQueue]'s doc comment):
-      // every visited tab's load shares this one queue, so only one topic
-      // is ever mid-fetch on the shared connection at a time. This
-      // tab's own [setState] calls for its two load stages still happen
-      // as soon as each network step actually completes, so its progress
-      // text updates live even while queued behind another tab — only the
-      // network calls themselves are serialized, not this widget's UI.
-      final objects = await widget.enqueueLoad(() async {
-        // A catalog with 200+ entries has been observed occasionally
-        // needing longer than fetchCatalog's own 30s default for a sync
-        // reply — raised to 90s here to match the same timeout already
-        // used elsewhere (see route_catalog.dart's addOrUpdateWaypoint/
-        // addOrUpdateRoute and bin/verify_waypoint_exists.dart) rather
-        // than surfacing a spurious "no reply" failure for what's really
-        // just a slow-but-working sync.
-        final entries = await widget.conn.fetchCatalog(widget.topic, timeout: const Duration(seconds: 90));
-        if (mounted) setState(() => _state = _Loading(entries.length));
-        if (entries.isEmpty) return const <DownloadedObject>[];
-        return widget.conn.fetchObjects(
-          widget.topic,
-          entries.map((e) => e.uuid).toList(),
-          timeout: const Duration(seconds: 90),
-        );
-      });
-      if (!mounted) return;
-      setState(() => _state = _Loaded(objects));
-    } on Object catch (e) {
-      if (!mounted) return;
-      setState(() => _state = _Failed(e));
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     super.build(context); // required by AutomaticKeepAliveClientMixin
-    final state = _state;
-    if (state is _Loading) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 12),
-            // By the time a _TopicList exists at all, the TCP connection
-            // itself is already up (see _RouteCatalogDialogState.build's
-            // own FutureBuilder around _connFuture, which gates whether
-            // _CatalogTabs — and so any _TopicList — gets built in the
-            // first place). So state.total == null here always means the
-            // catalog sync (tCatalogSync, gated behind the protocol's own
-            // ~10s preamble) is in flight, never that the socket itself is
-            // still connecting — "Connecting…" was misleading about which
-            // of those two (very different-feeling) waits was happening.
-            Text(state.total == null ? 'Syncing catalog…' : 'Loading ${state.total} ${widget.label.toLowerCase()}s…'),
-          ],
-        ),
-      );
-    }
-    if (state is _Failed) {
-      return Center(child: Text('Could not load ${widget.label.toLowerCase()}s: ${state.error}'));
-    }
-    final allObjects = (state as _Loaded).objects;
+    return ListenableBuilder(
+      listenable: widget.service,
+      builder: (context, _) => _buildBody(context),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    final catalog = switch (widget.topic) {
+      final t when t == topicRoutes => widget.service.routes,
+      final t when t == topicWaypoints => widget.service.waypoints,
+      _ => widget.service.tracks,
+    };
+    final allObjects = catalog.all;
     if (allObjects.isEmpty) {
       return Center(child: Text('No ${widget.label.toLowerCase()}s found on the plotter.'));
     }
@@ -591,12 +420,11 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
 
     setState(() => _busyUuids.add(object.uuid));
     try {
-      await widget.conn.deleteEntry(widget.topic, object.uuid, vstamp: object.vstamp);
+      // No manual local-list update needed here — RouteCatalogService.
+      // deleteEntry updates its own local copy and notifies listeners,
+      // which rebuilds this widget via the ListenableBuilder in build().
+      await widget.service.deleteEntry(widget.topic, object.uuid, vstamp: object.vstamp);
       if (!mounted) return;
-      final current = _state;
-      if (current is _Loaded) {
-        setState(() => _state = _Loaded(current.objects.where((o) => o.uuid != object.uuid).toList()));
-      }
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted "${object.name}".')));
     } on Object catch (e) {
       if (!mounted) return;
@@ -649,7 +477,9 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
     final failures = <String, Object>{};
     for (final object in targets) {
       try {
-        await widget.conn.deleteEntry(widget.topic, object.uuid, vstamp: object.vstamp);
+        // No manual local-list update needed — see the single-delete
+        // path's own comment above.
+        await widget.service.deleteEntry(widget.topic, object.uuid, vstamp: object.vstamp);
         deletedUuids.add(object.uuid);
       } on Object catch (e) {
         failures[object.name] = e;
@@ -658,10 +488,6 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
     }
     if (!mounted) return;
 
-    final current = _state;
-    if (current is _Loaded) {
-      setState(() => _state = _Loaded(current.objects.where((o) => !deletedUuids.contains(o.uuid)).toList()));
-    }
     setState(() {
       _bulkDeleting = false;
       _selecting = false;

@@ -1348,6 +1348,93 @@ void main() {
     expect(actual.json['sym'], expected.json['sym']);
     expect(actual.json['mtime'], isNotNull);
   });
+
+  test('pushes decodes a real captured plotter-initiated route update', () async {
+    // Real bytes captured (`0b32f738`) from a topicRoutes connection that
+    // never asked for anything -- the plotter sent this on its own after
+    // a route was drawn directly on its own screen, outside any app. See
+    // RouteCatalogConnection.pushes' own doc comment for the full story.
+    // This is the very first message in that sequence: the route just
+    // created, still named "0001", with no points yet.
+    final pushBytes = _hexToBytes(
+      '1d0000000200ca01933069d66c050000d04dd4326d050000b8010107b40101b101050711101aa8'
+      '8250c42847bbbdc33cab45cd61c20d8994b0fc2d1102190127900102'
+      '01000f8a0188011f8b08000000000004034d8c3b0ec3201005739'
+      '6ad4162013b84ab4491b57c0a0ac0c2e026cadd8de426e58ce6bd2f14ca112c082110188c91c22'
+      '42432462e827b2d0dd74fe7b80b5e71e5c9e9c58715bd9c358d5eb7fba0b71119ecad4e73c6065'
+      '632c8a96c7f06199c47a7bc8345a9b4d00ad5fa9aa39a4a3fc0be3fbfc70598850d4f90000000',
+    );
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    serverSub = fakeServer.listen((client) {
+      client.listen((chunk) {
+        // No request/reply logic needed for this test -- the push arrives
+        // unprompted, so the fake server just sends it once a client
+        // connects, ignoring whatever the client sends.
+      });
+      // Slight delay so the client's own socket listener (set up in
+      // RouteCatalogConnection's constructor, right after connect())
+      // is definitely attached before this arrives.
+      Future<void>.delayed(const Duration(milliseconds: 50), () => client.add(_wrapMsgFrame(pushBytes)));
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+
+    final push = await conn.pushes.first.timeout(const Duration(seconds: 2));
+    expect(push, isA<CatalogPushUpdate>());
+    final update = push as CatalogPushUpdate;
+    expect(update.topic, topicRoutes);
+    expect(update.object.uuid, '1aa88250-c428-47bb-bdc3-3cab45cd61c2');
+    expect(update.object.name, '0001');
+    expect(update.object.points, isEmpty);
+  });
+
+  test('pushes decodes a delete-shaped message (no gzip payload) as CatalogPushDelete', () async {
+    // Real bytes captured (`32715a73`, frame 206) of a genuine tDeleteEntry
+    // -- this client's own outgoing deleteEntry() builds the exact same
+    // wire shape, so these bytes double as a stand-in for what an incoming
+    // plotter-initiated delete push would look like (no real capture of an
+    // actual incoming delete push exists yet -- only add/update pushes
+    // have been observed live so far, see pushes' own doc comment).
+    final pushBytes = _hexToBytes(
+      '1d000000020030e9f0d5c953040000f8f0d5c9540400001f01071c031a02071110cba07a871d57'
+      '427686e8ac377efd5d750dae9ec7ff21',
+    );
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    serverSub = fakeServer.listen((client) {
+      client.listen((chunk) {});
+      Future<void>.delayed(const Duration(milliseconds: 50), () => client.add(_wrapMsgFrame(pushBytes)));
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+
+    final push = await conn.pushes.first.timeout(const Duration(seconds: 2));
+    expect(push, isA<CatalogPushDelete>());
+    final delete = push as CatalogPushDelete;
+    expect(delete.topic, topicRoutes);
+    expect(delete.uuid, 'cba07a87-1d57-4276-86e8-ac377efd5d75');
+  });
 }
 
 /// Decoded structural fields of an [RouteCatalogConnection.addOrUpdateWaypoint]

@@ -18,6 +18,7 @@ import 'helm_touch_surface.dart';
 import 'helm_video_view.dart';
 import 'platform_layout.dart';
 import 'route_catalog_dialog.dart';
+import 'route_catalog_service.dart';
 
 class HelmHomeScreen extends StatefulWidget {
   const HelmHomeScreen({super.key});
@@ -28,6 +29,7 @@ class HelmHomeScreen extends StatefulWidget {
 
 class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObserver {
   final _session = HelmSessionController();
+  final _catalogService = RouteCatalogService();
   final _hostController = TextEditingController();
   bool _controlsVisible = true; // desktop: always effectively true (shown)
   bool _isFullscreen = false;
@@ -107,6 +109,17 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     unawaited(_reconnectAfterResume(host));
   }
 
+  /// Connects both the touch/video session and the catalog service to
+  /// [host]. The catalog connection failing doesn't block the touch/video
+  /// one or vice versa — see [RouteCatalogService.connect]'s own doc
+  /// comment for why it's a separate, independently-connected service
+  /// rather than something layered onto [HelmSessionController]'s
+  /// [HelmClient] (different port, different protocol entirely).
+  Future<void> _connectBoth(String host) async {
+    await _session.connect(host);
+    unawaited(_catalogService.connect(host));
+  }
+
   /// Reconnects the touch session, then the video — in that order, and one
   /// at a time, rather than firing both off in parallel.
   ///
@@ -125,6 +138,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   /// targets the current, live HelmVideoView state.
   Future<void> _reconnectAfterResume(String host) async {
     await _session.connect(host);
+    unawaited(_catalogService.connect(host));
     if (!mounted) return;
     // Let the rebuild _session.connect's notifyListeners() triggered
     // actually run first, so _videoViewKey.currentState below is this
@@ -140,7 +154,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     final last = _session.lastHost;
     if (last != null && last.isNotEmpty) {
       _hostController.text = last;
-      await _session.connect(last);
+      await _connectBoth(last);
     } else {
       await _autoDiscoverAndConnect();
     }
@@ -152,7 +166,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     if (results.length == 1) {
       final host = _addressOf(results.first);
       _hostController.text = host;
-      await _session.connect(host);
+      await _connectBoth(host);
     }
     // Zero or multiple results: leave it to the user to pick via the
     // control bar (which lists discovered plotters below the host field).
@@ -185,6 +199,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     WakelockPlus.disable();
     _session.removeListener(_onSessionChanged);
     _session.dispose();
+    _catalogService.dispose();
     _hostController.dispose();
     super.dispose();
   }
@@ -365,11 +380,12 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   Future<void> _onConnectPressed() async {
     if (_session.isConnected) {
       _session.disconnect();
+      unawaited(_catalogService.disconnect());
       return;
     }
     final host = _hostController.text.trim();
     if (host.isEmpty) return;
-    await _session.connect(host);
+    await _connectBoth(host);
   }
 
   /// Picks a `.gpx` file, extracts its routes ([parseGpxRoutes]), and lets
@@ -423,35 +439,19 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     final host = _session.lastHost;
     if (host == null || host.isEmpty) return;
 
+    // Sent over _catalogService's already-open, long-lived connection —
+    // no new connect()/sync/close() cycle needed. See
+    // RouteCatalogService's own top doc comment for why a fresh
+    // post-write verification sync (an earlier version of this method
+    // did one) is deliberately NOT done: it was found live to be its own
+    // reliability risk at this catalog's size (200+ entries), reliably
+    // making the plotter reset the connection outright, or on a separate
+    // connection simply never replying within 90s. This service's local
+    // copy is instead kept in sync the same way the real app's is —
+    // updated optimistically on send, then reconciled by whatever the
+    // plotter pushes back on its own.
     try {
-      final conn = await RouteCatalogConnection.connect(host);
-      try {
-        // 90s, not addOrUpdateRoute's own 30s default — see
-        // route_catalog_dialog.dart's matching comment: a catalog with
-        // 200+ entries can occasionally need longer than 30s for the
-        // sync this method runs before sending.
-        //
-        // **Deliberately not verified afterward** — a real, if unlikely,
-        // failure mode where addOrUpdateRoute returns successfully but the
-        // route isn't actually in the catalog was found live-testing, but
-        // an immediate post-write verification sync turned out to be its
-        // own reliability risk at this catalog size (240+ entries): on the
-        // same connection it reliably made the plotter reset the TCP
-        // connection outright (generalizing an already-documented
-        // limitation — see route_catalog.dart's fetchObjects doc comment
-        // on two batch tGetObjects on one connection — to tCatalogSync as
-        // well), and even on a brand-new separate connection the sync
-        // reply consistently never arrived within 90s. Matches
-        // addOrUpdateWaypoint/deleteEntry, neither of which verifies
-        // after sending either.
-        await conn.addOrUpdateRoute(
-          chosen.name,
-          [for (final p in chosen.points) (p.lat, p.lon)],
-          timeout: const Duration(seconds: 90),
-        );
-      } finally {
-        await conn.close();
-      }
+      await _catalogService.addOrUpdateRoute(chosen.name, [for (final p in chosen.points) (p.lat, p.lon)]);
     } on Object catch (e) {
       _showSnack('Failed to save "${chosen.name}" to the plotter: $e');
       return;
@@ -493,9 +493,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   }
 
   Future<void> _onBrowseCatalogPressed() async {
-    final host = _session.lastHost;
-    if (host == null || host.isEmpty) return;
-    await showRouteCatalogDialog(context, host);
+    await showRouteCatalogDialog(context, _catalogService);
   }
 
   void _showSnack(String message) {
