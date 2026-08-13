@@ -3359,6 +3359,29 @@ class RouteCatalogConnection {
       // strictly need to understand.
       return;
     }
+
+    // **Added 2026-08-13, live-suspected cause of a plotter crash/reboot
+    // after an incoming push.** The push carries the plotter's own fresh
+    // `prevRemoteVer`/`newRemoteVer` pair for this topic — same envelope
+    // shape [_buildAddOrUpdateBody]'s own tail uses on the way out, just
+    // arriving in the other direction — but this method used to only
+    // decode the uuid/object from it, never updating [_remoteVerByTopic]
+    // with the plotter's own [newRemoteVer]. That leaves this
+    // connection's cached `remote_ver` stale the moment ANYTHING else
+    // changes the topic (this client's own writes, the real app's writes,
+    // or a change made directly on the plotter) — and the very next write
+    // this connection makes (e.g. [addOrUpdateRoute]/[addOrUpdateWaypoint]
+    // reusing that stale cached value instead of syncing, since 2026-08-13's
+    // fix to stop always re-syncing) would then be built on a
+    // `prevRemoteVer` the plotter no longer considers current. Updating it
+    // here keeps the cache honest without needing a fresh sync at all —
+    // the whole point of listening to pushes in the first place.
+    final (value: _, consumed: prefixLen) = _decodeLeb128(message.rest, 0);
+    if (prefixLen + 16 <= message.rest.length) {
+      final newRemoteVer = Uint8List.sublistView(message.rest, prefixLen + 8, prefixLen + 16);
+      _remoteVerByTopic[message.topicId] = newRemoteVer;
+    }
+
     final uuid = _formatUuid(Uint8List.sublistView(message.rest, uuidMarkerIdx + 3, uuidMarkerIdx + 3 + 16));
 
     final gzipIdx = _findBytes(message.rest, const [0x1F, 0x8B, 0x08]);

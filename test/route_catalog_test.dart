@@ -1399,6 +1399,66 @@ void main() {
     expect(update.object.points, isEmpty);
   });
 
+  test('a push updates the cached remote_ver, so the next write uses it instead of a stale value', () async {
+    // Same real push bytes as the test above -- its own newRemoteVer
+    // (`d04dd4326d050000`) is what a subsequent addOrUpdateRoute call on
+    // this connection should use as prevRemoteVer, instead of whatever
+    // was cached before the push (or the registration correlation id, if
+    // nothing had synced this topic yet). Found live 2026-08-13: without
+    // this, a write made shortly after receiving a push was built on a
+    // stale prevRemoteVer, live-suspected as the cause of a plotter
+    // crash/reboot after "create a waypoint on the plotter, delete it in
+    // the app, then import a route" in quick succession.
+    final pushBytes = _hexToBytes(
+      '1d0000000200ca01933069d66c050000d04dd4326d050000b8010107b40101b101050711101aa8'
+      '8250c42847bbbdc33cab45cd61c20d8994b0fc2d1102190127900102'
+      '01000f8a0188011f8b08000000000004034d8c3b0ec3201005739'
+      '6ad4162013b84ab4491b57c0a0ac0c2e026cadd8de426e58ce6bd2f14ca112c082110188c91c22'
+      '42432462e827b2d0dd74fe7b80b5e71e5c9e9c58715bd9c358d5eb7fba0b71119ecad4e73c6065'
+      '632c8a96c7f06199c47a7bc8345a9b4d00ad5fa9aa39a4a3fc0be3fbfc70598850d4f90000000',
+    );
+    const expectedNewRemoteVer = 'd04dd4326d050000'; // pushBytes' own newRemoteVer
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    Uint8List? sentRest;
+    serverSub = fakeServer.listen((client) {
+      client.listen((chunk) {
+        final bytes = Uint8List.fromList(chunk);
+        if (bytes.length < 8) return;
+        final length = ByteData.sublistView(bytes, 4, 8).getUint32(0, Endian.little);
+        if (bytes.length < 8 + length) return;
+        final request = bytes.sublist(8, 8 + length);
+        if (request.length < 6) return;
+        final msgType = ByteData.sublistView(request, 4, 6).getUint16(0, Endian.little);
+        if (msgType == tDeleteEntry) {
+          sentRest = Uint8List.sublistView(request, 6);
+        }
+      });
+      Future<void>.delayed(const Duration(milliseconds: 50), () => client.add(_wrapMsgFrame(pushBytes)));
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+
+    await conn.pushes.first.timeout(const Duration(seconds: 2));
+    await conn.addOrUpdateRoute('CLAUDE_TEST', const [(55.0, 10.0)]);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(sentRest, isNotNull, reason: 'addOrUpdateRoute must have sent a message');
+    final prefixLen = _leb128Length(sentRest!, 0);
+    final actualPrevRemoteVer = Uint8List.sublistView(sentRest!, prefixLen, prefixLen + 8);
+    expect(actualPrevRemoteVer, _hexToBytes(expectedNewRemoteVer), reason: 'prevRemoteVer must come from the push, not a stale cached/registration value');
+  });
+
   test('pushes decodes a delete-shaped message (no gzip payload) as CatalogPushDelete', () async {
     // Real bytes captured (`32715a73`, frame 206) of a genuine tDeleteEntry
     // -- this client's own outgoing deleteEntry() builds the exact same
