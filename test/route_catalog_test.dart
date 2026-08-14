@@ -1495,6 +1495,263 @@ void main() {
     expect(delete.topic, topicRoutes);
     expect(delete.uuid, 'cba07a87-1d57-4276-86e8-ac377efd5d75');
   });
+
+  test('fetchCatalog sends a byte-exact non-empty (differential) tCatalogSync when knownEntries is given', () async {
+    // 5 real [uuid, vstamp] pairs from a real capture (`0d2f840f`, a
+    // plotter user-data reset followed by a real ActiveCaptain backup
+    // restore) of the official app's own non-empty tCatalogSync request
+    // for topicRoutes -- see route_catalog.dart's _buildCatalogSyncBody
+    // doc comment for the full wire-format derivation. These 5 (of that
+    // real request's 75 total) were independently confirmed, entry by
+    // entry, to round-trip byte-exact through _buildCatalogSyncBody's
+    // record encoding.
+    final knownEntries = [
+      const CatalogEntry(uuid: 'd394f591-c50d-4f13-a497-900940c3b239', topic: topicRoutes, vstamp: 10067535587),
+      const CatalogEntry(uuid: '28103258-ac2a-4993-821f-4eb63755e49f', topic: topicRoutes, vstamp: 9978656180),
+      const CatalogEntry(uuid: '93ad0de3-2681-403c-8bef-42ef18c7c027', topic: topicRoutes, vstamp: 12310396025),
+      const CatalogEntry(uuid: '637905a5-24e2-41e7-9a7d-2ca7fa9c0e03', topic: topicRoutes, vstamp: 10420970862),
+      const CatalogEntry(uuid: 'ded9fa4e-040c-4298-b342-e0f348e0162c', topic: topicRoutes, vstamp: 12772976429),
+    ];
+    // Isolated persistence path -- _stableVersionStampFor persists to
+    // disk since 2026-08-14 (see its own doc comment) so this test must
+    // not read/write the real default path, or a stale value from a
+    // previous run (or another test) would make this test pass for the
+    // wrong reason. A fresh temp file per test run, deleted afterward.
+    final tempDir = await Directory.systemTemp.createTemp('route_catalog_test_');
+    final originalStampPath = debugStableVersionStampFilePath;
+    debugStableVersionStampFilePath = '${tempDir.path}/stable_version_stamps.json';
+    debugResetStableVersionStampCache();
+    addTearDown(() async {
+      debugStableVersionStampFilePath = originalStampPath;
+      debugResetStableVersionStampCache();
+      await tempDir.delete(recursive: true);
+    });
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    Uint8List? receivedSyncRequest;
+    final registrationCorrelationIdByTopic = <int, Uint8List>{};
+
+    serverSub = fakeServer.listen((client) {
+      final buf = BytesBuilder(copy: false);
+      client.listen((chunk) {
+        buf.add(chunk);
+        var bytes = buf.toBytes();
+        while (bytes.length >= 8) {
+          final length = ByteData.sublistView(bytes, 4, 8).getUint32(0, Endian.little);
+          if (bytes.length < 8 + length) break;
+          final request = bytes.sublist(8, 8 + length);
+          bytes = bytes.sublist(8 + length);
+
+          if (request.length < 6) continue;
+          final topicId = ByteData.sublistView(request, 0, 4).getUint32(0, Endian.little);
+          final msgType = ByteData.sublistView(request, 4, 6).getUint16(0, Endian.little);
+          if (msgType == 0x07) continue;
+
+          if (msgType == tRegisterTopic) {
+            // Last 8 bytes of a tRegisterTopic body are its own correlation
+            // id -- see route_catalog.dart's _registerTopic. Captured so
+            // this test can assert the non-empty tCatalogSync reuses it
+            // (see _registrationCorrelationIdByTopic's doc comment).
+            registrationCorrelationIdByTopic[topicId] = request.sublist(request.length - 8);
+            final replyInner = Uint8List(6 + 8);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tRegisterTopicReply, Endian.little);
+            replyInner[6] = 8;
+            client.add(_wrapMsgFrame(replyInner));
+            continue;
+          }
+          if (msgType == tCatalogSync) {
+            receivedSyncRequest = request;
+            // correlationId sits right after the outer LEB128 length
+            // prefix -- echo a minimal empty reply back using it, just
+            // enough for _awaitCatalogSyncReply/fetchCatalog to complete.
+            final requestBody = request.sublist(6);
+            final prefixLen = _leb128Length(requestBody, 0);
+            final correlationId = requestBody.sublist(prefixLen, prefixLen + 8);
+            final rest = Uint8List(2 + 8)
+              ..[0] = 0
+              ..[1] = 0
+              ..setRange(2, 10, correlationId);
+            final replyInner = Uint8List(6 + rest.length);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tCatalogSyncReply, Endian.little);
+            replyInner.setRange(6, 6 + rest.length, rest);
+            client.add(_wrapMsgFrame(replyInner));
+          }
+        }
+        buf.clear();
+        buf.add(bytes);
+      });
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+
+    await conn.fetchCatalogAndObjects(topicRoutes, knownEntries: knownEntries, catalogTimeout: const Duration(seconds: 2));
+
+    expect(receivedSyncRequest, isNotNull);
+    final sentBody = receivedSyncRequest!.sublist(6);
+    // Structural checks (the correlation id this connection picked is its
+    // own, not comparable to any real capture): a non-empty sync uses a
+    // 2-byte LEB128 outer length (unlike N=0's fixed 1-byte field), and
+    // the record list contains exactly 5 uuid markers, each followed by
+    // the expected real uuid bytes in order.
+    final outerLenByte0 = sentBody[0];
+    expect(outerLenByte0 & 0x80, 0x80, reason: 'a body this size needs a multi-byte LEB128 outer length');
+    for (final entry in knownEntries) {
+      final uuidBytes = _hexToBytes(entry.uuid.replaceAll('-', ''));
+      expect(_findBytes(sentBody, uuidBytes), greaterThanOrEqualTo(0), reason: 'missing uuid ${entry.uuid} in sent sync request');
+    }
+    // Exactly 5 catalog-uuid markers (02 07 11 10), one per known entry.
+    var markerCount = 0;
+    var searchFrom = 0;
+    while (true) {
+      final idx = _findHex(sentBody.sublist(searchFrom), '02071110');
+      if (idx < 0) break;
+      markerCount++;
+      searchFrom += idx + 4;
+    }
+    expect(markerCount, knownEntries.length);
+
+    // **The actual bug this test guards against, found live 2026-08-13**:
+    // the non-empty sync's correlation id must be topicRoutes' own
+    // tRegisterTopic correlation id, not a freshly-generated one -- two
+    // independent real captures showed this reuse, and picking a fresh
+    // value instead got no reply from a real plotter, twice. Extract this
+    // request's own correlation id (right after the outer LEB128 length
+    // prefix, see _buildCatalogSyncBody's doc comment) and compare.
+    final outerLenPrefixLen = _leb128Length(sentBody, 0);
+    final sentCorrelationId = sentBody.sublist(outerLenPrefixLen, outerLenPrefixLen + 8);
+    final registrationCorrelationId = registrationCorrelationIdByTopic[topicRoutes];
+    expect(registrationCorrelationId, isNotNull, reason: 'fake server never saw a tRegisterTopic for topicRoutes');
+    expect(
+      sentCorrelationId,
+      registrationCorrelationId,
+      reason: 'non-empty tCatalogSync must reuse topicRoutes\' own tRegisterTopic correlation id',
+    );
+  });
+
+  test('fetchCatalog encodes the vstamp length byte as actualLebLength+8, not always 0x0d', () async {
+    // Regression test for the fix in Update 47 (2026-08-14): the real
+    // capture's very first record used length byte 0x09 (not the 0x0d
+    // every other of its 74 sibling records used) because ITS vstamp (1)
+    // encodes to only 1 LEB128 byte, not the usual 5 -- 1+8=9=0x09,
+    // 5+8=13=0x0d, both real examples agree on the same "+8" formula.
+    // This was previously hardcoded to always emit 0x0d regardless of the
+    // real vstamp's LEB128 length, which is only byte-correct for the
+    // common (large vstamp) case.
+    final knownEntries = [
+      const CatalogEntry(uuid: 'd394f591-c50d-4f13-a497-900940c3b239', topic: topicRoutes, vstamp: 1),
+      const CatalogEntry(uuid: '28103258-ac2a-4993-821f-4eb63755e49f', topic: topicRoutes, vstamp: 10067535587),
+    ];
+
+    late StreamSubscription<Socket> serverSub;
+    final fakeServer = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    Uint8List? receivedSyncRequest;
+
+    serverSub = fakeServer.listen((client) {
+      final buf = BytesBuilder(copy: false);
+      client.listen((chunk) {
+        buf.add(chunk);
+        var bytes = buf.toBytes();
+        while (bytes.length >= 8) {
+          final length = ByteData.sublistView(bytes, 4, 8).getUint32(0, Endian.little);
+          if (bytes.length < 8 + length) break;
+          final request = bytes.sublist(8, 8 + length);
+          bytes = bytes.sublist(8 + length);
+
+          if (request.length < 6) continue;
+          final topicId = ByteData.sublistView(request, 0, 4).getUint32(0, Endian.little);
+          final msgType = ByteData.sublistView(request, 4, 6).getUint16(0, Endian.little);
+          if (msgType == 0x07) continue;
+
+          if (msgType == tRegisterTopic) {
+            final replyInner = Uint8List(6 + 8);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tRegisterTopicReply, Endian.little);
+            replyInner[6] = 8;
+            client.add(_wrapMsgFrame(replyInner));
+            continue;
+          }
+          if (msgType == tCatalogSync) {
+            receivedSyncRequest = request;
+            final requestBody = request.sublist(6);
+            final prefixLen = _leb128Length(requestBody, 0);
+            final correlationId = requestBody.sublist(prefixLen, prefixLen + 8);
+            final rest = Uint8List(2 + 8)
+              ..[0] = 0
+              ..[1] = 0
+              ..setRange(2, 10, correlationId);
+            final replyInner = Uint8List(6 + rest.length);
+            ByteData.view(replyInner.buffer).setUint32(0, topicId, Endian.little);
+            ByteData.view(replyInner.buffer).setUint16(4, tCatalogSyncReply, Endian.little);
+            replyInner.setRange(6, 6 + rest.length, rest);
+            client.add(_wrapMsgFrame(replyInner));
+          }
+        }
+        buf.clear();
+        buf.add(bytes);
+      });
+    });
+    addTearDown(() async {
+      await serverSub.cancel();
+      await fakeServer.close();
+    });
+
+    final conn = await RouteCatalogConnection.connect(
+      InternetAddress.loopbackIPv4.address,
+      port: fakeServer.port,
+      timeout: const Duration(seconds: 2),
+    );
+    addTearDown(conn.close);
+
+    await conn.fetchCatalogAndObjects(topicRoutes, knownEntries: knownEntries, catalogTimeout: const Duration(seconds: 2));
+
+    expect(receivedSyncRequest, isNotNull);
+    final sentBody = receivedSyncRequest!.sublist(6);
+
+    // Locate each entry's marker (02 07 11 10, right before its uuid) --
+    // the length byte immediately precedes the leb128 vstamp payload,
+    // which itself immediately precedes the marker, so the length byte's
+    // own position depends on the vstamp's encoded length (that's exactly
+    // what this test is checking): for vstamp=1 (1-byte leb128), the
+    // length byte sits 2 bytes before the marker ([lengthByte][0x01]);
+    // for vstamp=10067535587 (5-byte leb128), it sits 6 bytes before.
+    final firstUuidBytes = _hexToBytes('d394f591c50d4f13a497900940c3b239');
+    final firstUuidIdx = _findBytes(sentBody, firstUuidBytes);
+    expect(firstUuidIdx, greaterThanOrEqualTo(0), reason: 'first entry uuid not found');
+    final firstMarkerIdx = firstUuidIdx - 4;
+    expect(sentBody.sublist(firstMarkerIdx - 2, firstMarkerIdx), [0x09, 0x01], reason: 'vstamp=1 (1-byte leb128) should produce length byte 1+8=0x09 followed by the leb128 payload 0x01');
+
+    final secondUuidBytes = _hexToBytes('28103258ac2a4993821f4eb63755e49f');
+    final secondUuidIdx = _findBytes(sentBody, secondUuidBytes);
+    expect(secondUuidIdx, greaterThanOrEqualTo(0), reason: 'second entry uuid not found');
+    final secondMarkerIdx = secondUuidIdx - 4;
+    expect(sentBody[secondMarkerIdx - 6], 0x0d, reason: 'vstamp=10067535587 (5-byte leb128) should produce length byte 5+8=0x0d');
+  });
+}
+
+int _findBytes(Uint8List haystack, Uint8List needle) {
+  for (var i = 0; i + needle.length <= haystack.length; i++) {
+    var match = true;
+    for (var j = 0; j < needle.length; j++) {
+      if (haystack[i + j] != needle[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return i;
+  }
+  return -1;
 }
 
 /// Decoded structural fields of an [RouteCatalogConnection.addOrUpdateWaypoint]

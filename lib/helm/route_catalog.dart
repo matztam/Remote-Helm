@@ -370,6 +370,89 @@ List<CatalogEntry> _parseCatalogEntries(Uint8List body, int topic) {
   return entries;
 }
 
+/// The inverse of [_parseCatalogEntries]: builds a non-empty [tCatalogSync]
+/// request body listing [known] entries' `[vstamp, uuid]` pairs, in the
+/// exact wire format [_parseCatalogEntries] already parses out of a
+/// [tCatalogSyncReply] — **reverse-engineered 2026-08-13** from a real
+/// capture (`0d2f840f`, a plotter user-data reset followed by a real
+/// ActiveCaptain backup restore) whose client-sent, non-empty
+/// [tCatalogSync] request bodies parsed cleanly with [_parseCatalogEntries]'s
+/// own marker-scan algorithm (75 real route uuids, 128 raw waypoint
+/// records, 1 track record, zero exceptions) — confirming the request uses
+/// the identical 26-byte-record shape as the reply, not a separate format.
+///
+/// Real capture's outer structure (`topic`/`type` header omitted, this
+/// function returns only the bytes after those 6 bytes):
+/// ```
+/// [2-byte-LEB128 outerLen][8-byte correlationId][2-byte-LEB128 innerLen]
+/// [0x02 0x01][LEB128 count]
+/// [record]×count   -- each record: [0x0d][≤6-byte LEB128 vstamp]
+///                     [0x02 0x07 0x11 0x10][16-byte uuid]
+/// ```
+/// `outerLen`/`innerLen` each count only the bytes strictly after their own
+/// field — **not** self-referential (unlike some other length fields in
+/// this file, e.g. [RouteCatalogConnection._solveSelfReferentialLeb128Length]'s
+/// callers): confirmed against the real capture, where `outerLen`'s decoded
+/// value exactly equalled the byte count from right after the `outerLen`
+/// field to the message's end (and likewise for `innerLen`), with no
+/// adjustment for either field's own encoded width.
+///
+/// The vstamp length byte is `actualLebLength(vstamp) + 8` —
+/// **corrected 2026-08-14**, after re-examining the one real-capture
+/// record (the request's very first) that used `0x09` instead of the
+/// `0x0d` every other of the 74 remaining records used, which Update 33
+/// had left unresolved (couldn't reconcile it as either the declared
+/// upper bound or the actually-consumed length under the `-7`-offset
+/// formula [_decodeCatalogEntryVstamp]'s doc comment describes for the
+/// DECODE side). That record's own `vstamp` decoded to `1`, whose LEB128
+/// encoding is exactly 1 byte — `1 + 8 = 9 = 0x09`, matching exactly; the
+/// other 74 records' `vstamp`s all needed the full 5-byte LEB128 encoding
+/// typical of large real version-stamps — `5 + 8 = 13 = 0x0d`, also
+/// matching exactly. Both real examples agree on `+8`, not the decode
+/// side's `+7` (that formula only has to work as a safe upper bound for
+/// parsing, per its own doc comment — it was never claimed to be the
+/// exact encode-side rule). A `null`/missing `vstamp` (an entry
+/// [_parseCatalogEntries] couldn't decode one for) is sent as `0` rather
+/// than omitted — untested — but keeps every entry in [known]
+/// representable rather than silently dropping it from the request.
+///
+/// [correlationId] is spliced in directly (not solved for) — its own
+/// 8-byte width, fixed regardless of value, is all the length math below
+/// needs to account for.
+Uint8List _buildCatalogSyncBody(List<CatalogEntry> known, Uint8List correlationId) {
+  final records = BytesBuilder(copy: false);
+  for (final entry in known) {
+    final vstampBytes = _leb128(entry.vstamp ?? 0);
+    records
+      ..add([vstampBytes.length + 8])
+      ..add(vstampBytes)
+      ..add(_catalogUuidMarker)
+      ..add(_parseUuid(entry.uuid));
+  }
+  final recordBytes = records.toBytes();
+
+  final inner = BytesBuilder(copy: false)
+    ..add(const [0x02, 0x01])
+    ..add(_leb128(known.length))
+    ..add(recordBytes);
+  final innerBytes = inner.toBytes();
+
+  // innerLen counts only innerBytes -- correlationId sits BEFORE the
+  // innerLen field and isn't part of what it counts.
+  final innerLenBytes = _leb128(innerBytes.length);
+
+  final afterOuterLen = BytesBuilder(copy: false)
+    ..add(correlationId)
+    ..add(innerLenBytes)
+    ..add(innerBytes);
+  final afterOuterLenBytes = afterOuterLen.toBytes();
+  // outerLen counts everything after the outerLen field itself
+  // (correlationId + innerLenBytes + innerBytes).
+  final outerLenBytes = _leb128(afterOuterLenBytes.length);
+
+  return Uint8List.fromList([...outerLenBytes, ...afterOuterLenBytes]);
+}
+
 /// Decodes one catalog entry's trailing `vstamp` field at [offset] in
 /// [body] — see [_parseCatalogEntries]'s doc comment for the format
 /// (1-byte length, `len(payload)+7`, followed by that many unsigned
@@ -549,6 +632,121 @@ int get _clientUnitId => (debugClientUnitId ?? _clientUnitIdFallback) & 0xFFFFF;
 final int _clientUnitIdFallback = Random().nextInt(0x100000) & 0xFFFFF;
 
 int _syncVerStampSeq = 0xfe;
+
+/// A per-topic "dataset version stamp", stable for the lifetime of this
+/// running process (module-level, not per-[RouteCatalogConnection]) —
+/// **inferred 2026-08-14** from the real app's observed registration
+/// behavior: across many real captures, a given topic's [tRegisterTopic]
+/// correlation id was always the same value, never freshly random,
+/// including across separate connections and app restarts days apart.
+/// That's only explainable if the real app generates this value once ever
+/// (the first time it's needed) and persists it locally from then on,
+/// rather than picking a new one per connection.
+/// The real app registers each topic/dataset with a version stamp read
+/// from its own on-disk database — generated once, ever, then reused
+/// forever after (across reconnects AND app restarts, since it's
+/// persisted locally). This client has no on-disk persistence yet, so
+/// this only replicates the "stable within one running process" part:
+/// generated once per topic, the first time [_registerTopic] needs one,
+/// then reused for every later registration of that same topic on any
+/// later [RouteCatalogConnection] for the rest of this process's
+/// lifetime — unlike [_nextCorrelationId], which is called fresh (a new
+/// value) every time.
+///
+/// **Why this matters**: live testing found a non-empty/differential
+/// [tCatalogSync] (see [_buildCatalogSyncBody]) reliably got no reply at
+/// all from a real plotter, even after confirming every other structural
+/// detail (framing, record format, even reusing the registration's own
+/// correlation id within one connection — see
+/// [_registrationCorrelationIdByTopic]) was correct. The remaining gap:
+/// every connection this client ever made picked a brand-new random
+/// registration value, never the same value twice — but the real
+/// mechanism's whole point is a STABLE per-topic identity a plotter can
+/// recognize across a client's connections. A registration correlation id
+/// that's different every time can never look "already known" to the
+/// plotter, no matter what a later differential sync's uuid list claims.
+final Map<int, Uint8List> _stableTopicVersionStamp = {};
+
+/// Where [_stableVersionStampFor] persists its per-topic values across
+/// process restarts — **added 2026-08-14 to test the Update 45 hypothesis
+/// that in-process-only stability isn't enough**: the real app's
+/// equivalent value survives app restarts (stored in its own SQLite
+/// database, see [_stableTopicVersionStamp]'s doc comment), but every
+/// previous version of this field only survived within one running
+/// process. A caller (e.g. `test_manual/` scripts, or eventually the UI
+/// layer) may override this before the first [_registerTopic] call to
+/// point at a real persistent location; defaults to a fixed path under
+/// the system temp directory purely so this can be tested via repeated
+/// `flutter test` process runs without needing UI-layer plumbing yet —
+/// **not the final intended storage location**, which should be a proper
+/// app-data path chosen by the caller (see `credential.dart`'s own doc
+/// comment on leaving persistence to the caller, the same pattern this
+/// should probably follow once the hypothesis is confirmed).
+String debugStableVersionStampFilePath = '${Directory.systemTemp.path}/remote_helm_stable_version_stamps.json';
+
+Map<int, Uint8List>? _stableVersionStampDiskCache;
+
+Map<int, Uint8List> _loadStableVersionStampsFromDisk() {
+  if (_stableVersionStampDiskCache != null) return _stableVersionStampDiskCache!;
+  final file = File(debugStableVersionStampFilePath);
+  final result = <int, Uint8List>{};
+  if (file.existsSync()) {
+    try {
+      final json = jsonDecode(file.readAsStringSync()) as Map<String, dynamic>;
+      for (final entry in json.entries) {
+        result[int.parse(entry.key)] = Uint8List.fromList((entry.value as List).cast<int>());
+      }
+    } on Object {
+      // Corrupt/unreadable file -- start fresh rather than crash; a new
+      // value will be generated and overwrite it on next save.
+    }
+  }
+  _stableVersionStampDiskCache = result;
+  return result;
+}
+
+void _saveStableVersionStampsToDisk(Map<int, Uint8List> values) {
+  _stableVersionStampDiskCache = values;
+  final file = File(debugStableVersionStampFilePath);
+  final json = {for (final entry in values.entries) entry.key.toString(): entry.value.toList()};
+  try {
+    file.writeAsStringSync(jsonEncode(json));
+  } on Object {
+    // Best-effort -- a failure to persist just means the next process
+    // run picks a fresh value, same as before this existed.
+  }
+}
+
+/// Clears the in-memory caches [_stableTopicVersionStamp]/
+/// [_stableVersionStampDiskCache] without touching disk -- **for test
+/// isolation only**. Without this, once any test in a `flutter test`
+/// process populates these process-wide caches, every later test in the
+/// same run silently reuses those values regardless of
+/// [debugStableVersionStampFilePath] being changed, since the in-memory
+/// maps are separate from (and take priority over) the file.
+void debugResetStableVersionStampCache() {
+  _stableTopicVersionStamp.clear();
+  _stableVersionStampDiskCache = null;
+}
+
+/// Returns [topic]'s stable version stamp (see
+/// [_stableTopicVersionStamp]'s doc comment), generating and caching one
+/// via [_nextCorrelationId] the first time it's needed. **Persisted to
+/// disk since 2026-08-14** (see [debugStableVersionStampFilePath]) so the
+/// value survives across separate process runs, not just within one —
+/// loads any previously-saved values on first access, and immediately
+/// saves whenever a new topic's value is generated.
+Uint8List _stableVersionStampFor(int topic) {
+  if (_stableTopicVersionStamp.isEmpty) {
+    _stableTopicVersionStamp.addAll(_loadStableVersionStampsFromDisk());
+  }
+  final existing = _stableTopicVersionStamp[topic];
+  if (existing != null) return existing;
+  final fresh = _nextCorrelationId();
+  _stableTopicVersionStamp[topic] = fresh;
+  _saveStableVersionStampsToDisk(_stableTopicVersionStamp);
+  return fresh;
+}
 
 /// A version-stamp-shaped 8-byte value — see the doc comment above
 /// [_clientUnitId] for how this was reverse-engineered. `seq` starts at
@@ -856,6 +1054,21 @@ class RouteCatalogConnection {
   }
 
   final Set<int> _registeredTopics = {};
+
+  /// The correlation id [_registerTopic] used for each topic's own
+  /// [tRegisterTopic] on this connection — **required for a non-empty
+  /// [tCatalogSync], found live 2026-08-13** after two independent real
+  /// captures (`0d2f840f`, `9a59f873`) both showed a topic's non-empty
+  /// [tCatalogSync] request reusing the EXACT SAME 8-byte correlation id
+  /// as that same topic's own [tRegisterTopic] on the same connection —
+  /// not a coincidence (confirmed across 3 topics × 2 captures = 6
+  /// matching pairs, and [_nextCorrelationId]'s random component makes an
+  /// accidental match astronomically unlikely). Before this was
+  /// understood, [_syncCatalog]'s non-empty path picked its own fresh
+  /// [_nextCorrelationId] value instead — live-confirmed to get NO reply
+  /// at all, twice, while the N=0 path (which has never needed this reuse)
+  /// kept working normally.
+  final Map<int, Uint8List> _registrationCorrelationIdByTopic = {};
   bool _didPreamble = false;
 
   /// Every real capture examined registered these two topics — in this
@@ -994,7 +1207,13 @@ class RouteCatalogConnection {
   /// plotter never produces it in.
   void _registerTopic(int topic) {
     if (_registeredTopics.contains(topic)) return;
-    final correlationId = _nextCorrelationId();
+    // Stable per-topic value, not a fresh one every connection -- see
+    // _stableTopicVersionStamp's doc comment for why (a real plotter's
+    // digest/merge mechanism is hypothesized to need a value it can
+    // recognize as "the same client" across connections, not a fresh
+    // registration id every time).
+    final correlationId = _stableVersionStampFor(topic);
+    _registrationCorrelationIdByTopic[topic] = correlationId;
     final sub = _registerTopicSub[topic];
     if (sub == null) {
       throw RouteCatalogException('no known registration "sub" value for topic 0x${topic.toRadixString(16)}');
@@ -1103,20 +1322,55 @@ class RouteCatalogConnection {
 
   /// While a [tCatalogSync] digest is being processed, the plotter can send
   /// its **own** [tGetObject] request back on the same topic — the "merge"
-  /// in digest-based merge is two-way (confirmed live: the plotter's own
-  /// data-request message asks the peer for a
-  /// specific version, not a UUID). It appears to block the plotter's own
-  /// [tCatalogSyncReply] until answered. Its body is byte-for-byte the same
-  /// shape as this client's own real captured `0x0c`/`0x0d` request/reply
-  /// pair (`0c <8-byte version> 03 01 01 00`), so it's answered by echoing
-  /// the request back as a [tGetObjectReply] — confirmed live to unblock
-  /// the plotter and let the real [tCatalogSyncReply] through. Returns a
-  /// subscription the caller must cancel once done waiting for the digest
-  /// reply.
+  /// in digest-based merge is two-way. It appears to block the plotter's own
+  /// [tCatalogSyncReply] until answered. Its body comes in **two different
+  /// shapes**, found live 2026-08-14 via a from-scratch,
+  /// direction-and-reassembly-correct re-scan of every pcap on file (not
+  /// just the two captures examined when the original single-shape
+  /// assumption was written):
+  ///
+  /// 1. **Generic/fixed-tail** (`0c <8-byte version> 03 01 01 00`, no uuid
+  ///    marker) — the shape this function's original doc comment described.
+  ///    Echoing `m.rest` back as [tGetObjectReply] is **confirmed correct
+  ///    for this shape specifically**: it's what every previously-live-
+  ///    confirmed N=0 sync (Update 22 onward) actually exercised, and a
+  ///    2026-08-14 live test replacing the echo with [tGetObjectError] for
+  ///    this shape broke a plain N=0 sync that used to work (the plotter
+  ///    responded with what looks like a topic re-registration instead of
+  ///    continuing) — reverted back to echoing for this case.
+  /// 2. **Uuid-carrying** (`0c <8-byte version> <len> 01 01 01 07 11 10
+  ///    <16-byte uuid>`) — found in two independent pure "sync only, no
+  ///    create" captures (`342c2f35`, `34d945fa`), asking about one
+  ///    specific object. The real app's [tGetObjectReply] here carries
+  ///    **real, different, gzip-compressed object content** — not an echo —
+  ///    because the real app has that object cached locally. This client is
+  ///    a pure catalog/content **downloader** — [DownloadedObject] only ever
+  ///    stores decoded [RoutePoint]s, never the raw wire bytes needed to
+  ///    re-serialize an object — so there is structurally no real content
+  ///    this function could ever send back for a uuid-carrying request.
+  ///    [tGetObjectError] (`08 00 00 00 00 00 00 00 00`, the same fixed body
+  ///    a real plotter sends this client when rejecting one of *our*
+  ///    [tGetObject] requests — see that constant's doc comment) is used for
+  ///    this shape as the most defensible reply given the wire format, but
+  ///    **still unverified**: no capture on file shows the real app ever
+  ///    sending it (the real app always has the content, so it never needed
+  ///    to reject), and this shape hasn't had a live test of its own yet
+  ///    (the 2026-08-14 live test above only exercised the generic shape).
+  ///
+  /// The two shapes are told apart by searching for the `07 11 10` uuid
+  /// marker in the request body — present only in shape 2.
+  ///
+  /// Returns a subscription the caller must cancel once done waiting for the
+  /// digest reply.
   StreamSubscription<_InnerMessage> _autoReplyToServerGetObject(int topic) {
     return _messages.stream.listen((m) {
       if (m.topicId == topic && m.msgType == tGetObject) {
-        _send(topic, tGetObjectReply, 0, m.rest);
+        final hasUuidMarker = _findBytes(m.rest, const [0x07, 0x11, 0x10]) >= 0;
+        if (hasUuidMarker) {
+          _send(topic, tGetObjectError, 0, const [0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
+        } else {
+          _send(topic, tGetObjectReply, 0, m.rest);
+        }
       }
     });
   }
@@ -1151,8 +1405,14 @@ class RouteCatalogConnection {
   /// exactly like "no reply from the plotter" (a real, structural
   /// problem this file spent a long time chasing) even though the
   /// request/reply mechanism itself was already correct.
-  Future<List<CatalogEntry>> fetchCatalog(int topic, {Duration timeout = const Duration(seconds: 30)}) async {
-    final result = await _fetchCatalog(topic, timeout: timeout);
+  /// [knownEntries] — see [_buildCatalogSyncBody]'s doc comment — makes
+  /// this a non-empty/differential sync instead of the default N=0 one.
+  Future<List<CatalogEntry>> fetchCatalog(
+    int topic, {
+    Duration timeout = const Duration(seconds: 30),
+    List<CatalogEntry>? knownEntries,
+  }) async {
+    final result = await _fetchCatalog(topic, timeout: timeout, knownEntries: knownEntries);
     return result.entries;
   }
 
@@ -1182,6 +1442,7 @@ class RouteCatalogConnection {
   Future<({List<CatalogEntry> entries, Uint8List remoteVer, List<CatalogEntry> allEntries})> _fetchCatalog(
     int topic, {
     required Duration timeout,
+    List<CatalogEntry>? knownEntries,
   }) async {
     await _ensurePreamble(timeout);
     // Every real capture registers *both* topicWaypoints and topicRoutes on
@@ -1248,7 +1509,7 @@ class RouteCatalogConnection {
       }
     }
 
-    return _syncCatalog(topic, n0Tail, timeout: timeout);
+    return _syncCatalog(topic, n0Tail, timeout: timeout, knownEntries: knownEntries);
   }
 
   /// Sends [tCatalogSync] (the N=0 empty-list request — see
@@ -1279,23 +1540,52 @@ class RouteCatalogConnection {
   /// confirmed byte-for-byte for both `0x4` and [topicWaypoints] in the
   /// real capture. [fetchObjects] now requires callers to pass this value
   /// in explicitly rather than picking its own via [_nextCorrelationId].
+  /// [knownEntries], if non-null and non-empty, sends the non-empty
+  /// differential-sync request format ([_buildCatalogSyncBody]) instead of
+  /// the N=0 empty-list request [tail] encodes — see
+  /// [_buildCatalogSyncBody]'s own doc comment for the wire format and how
+  /// it was derived. `null`/empty keeps today's N=0 behavior exactly, so a
+  /// first-ever sync on a connection/topic (nothing known yet) is
+  /// unaffected by this parameter's existence.
+  ///
+  /// **The non-empty path's correlation id is [topic]'s own
+  /// [_registerTopic] correlation id, NOT a fresh one — found live
+  /// 2026-08-13.** See [_registrationCorrelationIdByTopic]'s doc comment:
+  /// two independent real captures both show a topic's non-empty
+  /// [tCatalogSync] reusing that same topic's [tRegisterTopic] correlation
+  /// id byte-for-byte. A fresh [_nextCorrelationId] value here (this
+  /// method's old behavior, still used for the N=0 path since that's never
+  /// needed the reuse) got no reply at all, twice, before this fix.
   Future<({List<CatalogEntry> entries, Uint8List remoteVer, List<CatalogEntry> allEntries})> _syncCatalog(
     int topic,
     List<int> tail, {
     required Duration timeout,
+    List<CatalogEntry>? knownEntries,
   }) async {
-    final correlationId = _nextCorrelationId();
-    final rest = <int>[...correlationId, ...tail];
+    final isDifferential = knownEntries != null && knownEntries.isNotEmpty;
+    final correlationId = isDifferential && _registrationCorrelationIdByTopic.containsKey(topic)
+        ? _registrationCorrelationIdByTopic[topic]!
+        : _nextCorrelationId();
     final getObjectSub = _autoReplyToServerGetObject(topic);
     final _InnerMessage reply;
     try {
-      // lengthFieldBytes=1 here, not 2 — confirmed from the real N=0
-      // capture, unlike every non-empty [tCatalogSync] this file has seen
-      // (which all use a 2-byte length field carrying the `27*N+intercept`
-      // value). [rest]'s own length (14 bytes: 8-byte correlation id + the
-      // 6-byte tail) is written directly, matching the real capture's
-      // `fieldA=14` exactly — no separate override needed.
-      _send(topic, tCatalogSync, 1, rest);
+      if (isDifferential) {
+        // [_buildCatalogSyncBody] already includes its own outer LEB128
+        // length prefix and the correlation id internally, so this is sent
+        // with lengthFieldBytes=0 (no separate length field) rather than
+        // the fixed 1-byte field the N=0 path below uses.
+        final body = _buildCatalogSyncBody(knownEntries, correlationId);
+        _send(topic, tCatalogSync, 0, body);
+      } else {
+        final rest = <int>[...correlationId, ...tail];
+        // lengthFieldBytes=1 here, not 2 — confirmed from the real N=0
+        // capture, unlike every non-empty [tCatalogSync] this file has seen
+        // (which all use a 2-byte length field carrying the `27*N+intercept`
+        // value). [rest]'s own length (14 bytes: 8-byte correlation id + the
+        // 6-byte tail) is written directly, matching the real capture's
+        // `fieldA=14` exactly — no separate override needed.
+        _send(topic, tCatalogSync, 1, rest);
+      }
       reply = await _awaitCatalogSyncReply(topic, correlationId, timeout);
     } finally {
       await getObjectSub.cancel();
@@ -2867,17 +3157,36 @@ class RouteCatalogConnection {
   /// `bin/helm_cli.dart`'s `--fetch-objects-limit`) without reintroducing
   /// an `await` gap: the cap is applied to the same in-flight uuid list,
   /// still inside this one unbroken call.
+  ///
+  /// **Uses [fetchObjectsChunked], not [fetchObjects], since 2026-08-13**
+  /// — see [fetchObjectsChunked]'s own doc comment: an unchunked batch for
+  /// a topic this size (currently 64 real routes) was live-confirmed to
+  /// reset the connection. [chunkSize] is exposed so cautious/incremental
+  /// live testing (same reasoning as [objectsLimit]) can probe smaller
+  /// values before trusting the default.
+  ///
+  /// [knownEntries], if given (non-null, non-empty), makes the sync
+  /// non-empty/differential — see [_buildCatalogSyncBody]'s doc comment.
+  /// **The reply is still parsed as the plotter's full current view of the
+  /// topic, same as the N=0 path** — confirmed via a real capture
+  /// (`0d2f840f`) where a non-empty sync's reply still listed every known
+  /// entry, not a minimal delta; the benefit of passing [knownEntries] is
+  /// presumed to be letting the plotter skip recomputing its own digest
+  /// from scratch, not a smaller/different reply shape this method would
+  /// need to handle differently.
   Future<List<DownloadedObject>> fetchCatalogAndObjects(
     int topic, {
     Duration catalogTimeout = const Duration(seconds: 30),
     Duration objectsTimeout = const Duration(seconds: 60),
     int? objectsLimit,
+    int chunkSize = 10,
+    List<CatalogEntry>? knownEntries,
   }) async {
-    final sync = await _fetchCatalog(topic, timeout: catalogTimeout);
+    final sync = await _fetchCatalog(topic, timeout: catalogTimeout, knownEntries: knownEntries);
     if (sync.entries.isEmpty) return const [];
     final uuids = sync.entries.map((e) => e.uuid);
     final limited = objectsLimit != null ? uuids.take(objectsLimit) : uuids;
-    return fetchObjects(topic, limited.toList(), remoteVer: sync.remoteVer, timeout: objectsTimeout);
+    return fetchObjectsChunked(topic, limited.toList(), remoteVer: sync.remoteVer, chunkSize: chunkSize, timeout: objectsTimeout);
   }
 
   /// Debug/investigation helper: sends a [tCatalogSync] with explicitly
@@ -3256,6 +3565,39 @@ class RouteCatalogConnection {
     // (Uint8List in, List<DownloadedObject> out) since isolate boundaries
     // can only cross with data, not closures over this connection's state.
     return Isolate.run(() => _decodeBatchReply(reply.rest));
+  }
+
+  /// Like [fetchObjects], but splits [uuids] into groups of at most
+  /// [chunkSize], sending one batch [tGetObject] per group, sequentially,
+  /// all reusing the same [remoteVer] (no re-sync between chunks — that
+  /// exact approach was already tried and found broken live 2026-08-08,
+  /// see [fetchObjects]'s own doc comment: a second batch tGetObject on an
+  /// already-synced topic/connection reliably gets no reply at all,
+  /// whether or not a resync precedes it). Exists because a single
+  /// unchunked batch for **routes** (many embedded points per object,
+  /// unlike single-point waypoints) was live-confirmed 2026-08-13 to
+  /// reliably reset the connection outright at this catalog's real size
+  /// (64 routes) — reproduced twice, isolated down to this exact request,
+  /// with zero writes or other topics involved (see
+  /// `remote_helm_re/findings/00_STATUS.md` Update 27). The real app is
+  /// never observed sending a client-initiated bulk content batch at all
+  /// (see Update 28) — this chunking exists purely so this client can
+  /// still get every object's content up front without lazy-loading
+  /// (an explicit product requirement), not because it replicates
+  /// anything the real app does.
+  Future<List<DownloadedObject>> fetchObjectsChunked(
+    int topic,
+    List<String> uuids, {
+    required Uint8List remoteVer,
+    int chunkSize = 10,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final results = <DownloadedObject>[];
+    for (var i = 0; i < uuids.length; i += chunkSize) {
+      final chunk = uuids.sublist(i, i + chunkSize > uuids.length ? uuids.length : i + chunkSize);
+      results.addAll(await fetchObjects(topic, chunk, remoteVer: remoteVer, timeout: timeout));
+    }
+    return results;
   }
 
   /// Sends the batch [tGetObject] request and returns the raw
