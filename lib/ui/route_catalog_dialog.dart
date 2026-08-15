@@ -57,11 +57,30 @@ class RouteCatalogDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // **Fixed `width: 420`/`height: 460` made responsive 2026-08-15** —
+    // live-reproduced two related overflow bugs on a phone screen: (a) a
+    // list row's trailing action buttons pushed off the right edge, since
+    // 420dp left too little margin around the dialog for the row's three
+    // IconButtons to fit; (b) once (a) was fixed, a second report showed
+    // the dialog's fixed 460dp height left almost no room for the actual
+    // list (below the tab bar/search field/AlertDialog's own title+actions
+    // chrome) on a phone in landscape, where the whole screen is only
+    // ~400-450dp tall to begin with. Both dimensions are now capped at
+    // their old fixed values (unchanged on tablet/desktop, where those
+    // were always comfortable) but shrink to fit smaller screens instead
+    // of forcing the old fixed size regardless.
+    final screenSize = MediaQuery.sizeOf(context);
+    final dialogWidth = math.min(420.0, screenSize.width - 48);
+    // 160 budgets for the AlertDialog's own title, action buttons, and
+    // padding around this content box — not exact, but enough margin that
+    // the whole dialog reliably fits on-screen instead of being clipped by
+    // the display edges (which showDialog doesn't otherwise prevent).
+    final dialogHeight = math.min(460.0, screenSize.height - 160);
     return AlertDialog(
       title: const Text('Plotter routes, waypoints & tracks'),
       content: SizedBox(
-        width: 420,
-        height: 460,
+        width: dialogWidth,
+        height: dialogHeight,
         child: ListenableBuilder(
           listenable: service,
           builder: (context, _) {
@@ -315,7 +334,7 @@ class _TopicListState extends State<_TopicList> with AutomaticKeepAliveClientMix
                                     }),
                             )
                           : Icon(widget.icon),
-                      title: Text(object.name),
+                      title: Text(object.name, overflow: TextOverflow.ellipsis),
                       subtitle: Text(_subtitleFor(object)),
                       onTap: _selecting && !_bulkDeleting
                           ? () => setState(() {
