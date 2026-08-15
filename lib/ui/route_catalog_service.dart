@@ -38,28 +38,6 @@ class TopicCatalog {
       _byUuid[o.uuid] = o;
     }
   }
-
-  /// This topic's currently-known entries as `[uuid, vstamp]` pairs, in
-  /// the shape [RouteCatalogConnection.fetchCatalogAndObjects]'s
-  /// `knownEntries` parameter expects for a differential sync on a later
-  /// `connect()` — see that parameter's own doc comment. `topic` is
-  /// irrelevant to what a differential sync request encodes (only
-  /// uuid/vstamp are), so any fixed value works; `topicRoutes` is used
-  /// arbitrarily rather than adding a topic parameter nothing reads.
-  ///
-  /// Uses [DownloadedObject.vstamp] (the object's own JSON `"vstamp"`
-  /// field), not a separately-tracked catalog-entry vstamp — this service
-  /// never stores the latter once an object is fully downloaded. Both are
-  /// documented as the plotter's version-stamp for the same object from
-  /// two different messages (see [CatalogEntry.vstamp]'s and
-  /// [DownloadedObject.vstamp]'s own doc comments) — treated as
-  /// interchangeable here, consistent with how [RouteCatalogConnection.
-  /// deleteEntry] already uses a [DownloadedObject]-sourced vstamp as
-  /// `del_vstamp`. Not independently confirmed for a differential sync
-  /// request specifically.
-  List<CatalogEntry> get _knownEntries => [
-    for (final o in _byUuid.values) CatalogEntry(uuid: o.uuid, topic: topicRoutes, vstamp: o.vstamp),
-  ];
 }
 
 enum RouteCatalogServiceState { idle, connecting, syncing, ready, error }
@@ -118,18 +96,24 @@ class RouteCatalogService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// **Debug/investigation flag: when false (the default), [connect] never
-  /// passes `knownEntries`, always using the N=0 sync — added 2026-08-13.**
-  /// The differential sync itself ([RouteCatalogConnection._buildCatalogSyncBody])
-  /// got NO reply at all, twice in a row, in live testing of a second
-  /// `connect()` on the same session (63-75 known routes/waypoints) — see
-  /// `remote_helm_re/findings/00_STATUS.md` Update 34. Not yet understood
-  /// whether that's the one unresolved record-encoding edge case (Update
-  /// 33), the un-chunked sync request itself being too large at this
-  /// entry count (never tested smaller), or something else — kept off by
-  /// default so a second-or-later [connect] doesn't reliably fail while
-  /// this is unresolved. [TopicCatalog._knownEntries] and the wiring below
-  /// are otherwise complete and ready once this is confirmed safe.
+  /// **Debug/investigation flag: when false, [connect] never passes
+  /// `knownObjects`, always using the N=0 sync + full download.**
+  ///
+  /// Off by default again as of 2026-08-14 (was briefly `true` the same
+  /// day). The crash this whole rework was for is fixed by the *other*
+  /// half of it alone: a first-ever sync now sends exactly one unchunked
+  /// batch [tGetObject] instead of the old chunked multi-request burst,
+  /// and that alone was confirmed live, twice, to no longer crash the
+  /// plotter (see `remote_helm_re/findings/00_STATUS.md` Update 76). The
+  /// differential half (this flag) is a separate, non-essential
+  /// optimization — a faster reconnect once a catalog is already cached —
+  /// and live testing found the plotter simply never replies to the
+  /// non-empty digest even though it's now byte-verified correct against
+  /// a real capture (Update 75's fix to `_buildCatalogSyncBody`): no
+  /// crash, just a silent timeout. Since the crash fix doesn't need this
+  /// path, leave it off until the digest's actual reply requirements are
+  /// understood, and flip back to `true` only for further differential-
+  /// sync investigation, not for normal use.
   static bool debugUseDifferentialSync = false;
 
   /// Opens one [RouteCatalogConnection], does exactly one
@@ -138,26 +122,21 @@ class RouteCatalogService extends ChangeNotifier {
   /// [RouteCatalogConnection.pushes] for the rest of this service's
   /// lifetime (until [disconnect]/[dispose]).
   ///
-  /// **Chunked since 2026-08-13** — a single unchunked batch content
-  /// download for a topic this size (currently 64 real routes, each
-  /// carrying many embedded points) was live-confirmed to reset the
-  /// plotter's TCP connection outright; see [RouteCatalogConnection.
-  /// fetchObjectsChunked]'s doc comment. Live-confirmed working end-to-end
-  /// through this method specifically (not just in isolation): a real
-  /// connect loaded 63 routes/128 waypoints/1 track with no reset.
-  ///
-  /// **Differential sync gated behind [debugUseDifferentialSync] (off by
-  /// default)** — see that flag's own doc comment for why: passing
-  /// [TopicCatalog._knownEntries] as `knownEntries` (so a second-or-later
-  /// connect only needs the plotter to describe what's new/changed) is
-  /// implemented but not yet live-confirmed safe.
+  /// **Sync/download shape reworked 2026-08-14** — one content request per
+  /// topic, never a chunked burst: a first-ever sync downloads everything
+  /// in a single batch request, a later sync sends the plotter this
+  /// service's cached objects as a differential digest and downloads only
+  /// the delta (merged over the cache inside
+  /// [RouteCatalogConnection.fetchCatalogAndObjects] — see its doc comment
+  /// for the crash-capture evidence that forced this rework, and
+  /// [debugUseDifferentialSync] for the rollback flag).
   Future<void> connect(String host, {Duration timeout = const Duration(seconds: 30)}) async {
     // Captured before [disconnect] runs (below) -- disconnect() itself
     // never clears these, but reading them first removes any doubt about
     // ordering as this method evolves.
-    final knownRoutes = debugUseDifferentialSync ? routes._knownEntries : const <CatalogEntry>[];
-    final knownWaypoints = debugUseDifferentialSync ? waypoints._knownEntries : const <CatalogEntry>[];
-    final knownTracks = debugUseDifferentialSync ? tracks._knownEntries : const <CatalogEntry>[];
+    final knownRoutes = debugUseDifferentialSync ? routes.all : const <DownloadedObject>[];
+    final knownWaypoints = debugUseDifferentialSync ? waypoints.all : const <DownloadedObject>[];
+    final knownTracks = debugUseDifferentialSync ? tracks.all : const <DownloadedObject>[];
 
     await disconnect();
     _setState(RouteCatalogServiceState.connecting, message: 'Connecting to $host…');
@@ -172,11 +151,25 @@ class RouteCatalogService extends ChangeNotifier {
 
     _setState(RouteCatalogServiceState.syncing, message: 'Loading catalog…');
     try {
-      final routeObjects = await conn.fetchCatalogAndObjects(topicRoutes, knownEntries: knownRoutes);
+      final routeObjects = await conn.fetchCatalogAndObjects(topicRoutes, knownObjects: knownRoutes);
       routes._replaceAll(routeObjects);
-      final waypointObjects = await conn.fetchCatalogAndObjects(topicWaypoints, knownEntries: knownWaypoints);
+      // **Gap added 2026-08-15 (remote_helm_re/findings/00_STATUS.md
+      // Updates 124/125) — the actual root cause of this whole session's
+      // main crash.** A live-isolated minimal repro proved a SECOND
+      // tCatalogSync for a DIFFERENT topic on the SAME connection, sent
+      // within ~9-10s of a first topic's completed sync, reliably crashes
+      // the plotter (RST ~9-10s later) -- with zero write operations and a
+      // verified-empty catalog, ruling out every previous storage/content
+      // theory. A single topic sync alone never crashes. A second sync
+      // after a 15s gap is safe (also live-verified). This delay is a
+      // confirmed-safe but not yet minimized workaround -- 15s was the
+      // first value tried, not bisected down from the ~9-10s failure
+      // window, so it likely has more margin than strictly needed.
+      await Future<void>.delayed(const Duration(seconds: 15));
+      final waypointObjects = await conn.fetchCatalogAndObjects(topicWaypoints, knownObjects: knownWaypoints);
       waypoints._replaceAll(waypointObjects);
-      final trackObjects = await conn.fetchCatalogAndObjects(topicTrack, knownEntries: knownTracks);
+      await Future<void>.delayed(const Duration(seconds: 15));
+      final trackObjects = await conn.fetchCatalogAndObjects(topicTrack, knownObjects: knownTracks);
       tracks._replaceAll(trackObjects);
     } on Object catch (e) {
       _setState(RouteCatalogServiceState.error, message: 'Could not load catalog: $e');
@@ -192,6 +185,17 @@ class RouteCatalogService extends ChangeNotifier {
         // reconnect explicitly rather than this service silently retrying.
       },
     );
+
+    // Marks "now" as the last write-like activity on this connection, so
+    // [_waitForWriteSpacing] also paces the FIRST write after connecting,
+    // not just writes after each other. Added after a live plotter
+    // crash/reboot on a GPX route import that happened seconds after
+    // connecting — the exact same "plotter reset while a request was still
+    // being processed" symptom [_minWriteSpacing] was added for between
+    // consecutive writes, but never guarded against for the sync burst
+    // [connect] itself just did (three chunked topic downloads) followed
+    // immediately by a write.
+    _lastWriteAt = DateTime.now();
 
     _setState(RouteCatalogServiceState.ready, message: 'Catalog ready.');
   }
@@ -225,6 +229,13 @@ class RouteCatalogService extends ChangeNotifier {
     return resultUuid;
   }
 
+  /// **⚠️ KNOWN UNSAFE — no call sites left in the UI as of 2026-08-15, do
+  /// not wire this back up without reading
+  /// [RouteCatalogConnection.addOrUpdateRoute]'s doc comment first.** Every
+  /// route created this way reliably crashes the plotter's own editor when
+  /// later opened there — see remote_helm_re/findings/00_STATUS.md Updates
+  /// 127-129.
+  ///
   /// Creates/updates a route — see [addOrUpdateWaypoint]'s doc comment for
   /// why the local copy is updated optimistically rather than by waiting
   /// for a push, and for [_waitForWriteSpacing].

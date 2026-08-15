@@ -393,23 +393,21 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   /// `<rte>`, mirroring the plotter-selection flow in [_onDiscoverPressed])
   /// and whether to also start active navigation on it immediately.
   ///
-  /// **Two independent, complementary mechanisms**, both always/optionally
-  /// used together rather than as alternatives:
-  /// - [RouteCatalogConnection.addOrUpdateRoute] (`route_catalog.dart`)
-  ///   durably saves the route into the plotter's own route catalog — the
-  ///   same list Browse/Delete already shows — but does NOT activate it
-  ///   for navigation. Always run.
-  /// - [syncRoute] (`route_sync.dart`, the original/only import mechanism
-  ///   before [addOrUpdateRoute] existed) immediately activates the route
-  ///   for navigation on the plotter, but does NOT durably save it to the
-  ///   catalog — only run when the user checks "Start navigating this
-  ///   route immediately" in the picker dialog below. [syncRoute] supports
-  ///   routes of any point count (see route_sync.dart's top doc comment)
-  ///   — one small caveat remains: a route-level marker byte in the wire
-  ///   format isn't fully understood yet and is always sent as the one
-  ///   value confirmed to work, so a route with a different-from-that
-  ///   value might be rejected or misinterpreted by the plotter (untested
-  ///   beyond the two point counts verified so far).
+  /// **Only uses [syncRoute] (`route_sync.dart`) — does NOT durably save to
+  /// the plotter's route catalog.** [RouteCatalogConnection.addOrUpdateRoute]
+  /// used to be run here too (unconditionally, before offering to also
+  /// navigate), but is disabled as of 2026-08-15: every route it has ever
+  /// created reliably crashes the plotter's own touch-screen editor the
+  /// moment a human opens that route there afterward — confirmed live,
+  /// repeatedly, root cause not yet found (see
+  /// remote_helm_re/findings/00_STATUS.md Updates 127-129). [syncRoute]
+  /// activates the route for immediate navigation without saving it to the
+  /// catalog, and has never been implicated in that bug — it's the only
+  /// safe way to get a GPX route onto the plotter right now. This means a
+  /// GPX import is temporarily navigation-only: it won't appear later in
+  /// Browse/Delete, and [syncRoute] only supports routes with exactly 4
+  /// points (see route_sync.dart's top doc comment) — anything else can't
+  /// be imported at all until [addOrUpdateRoute] is fixed.
   Future<void> _onImportGpxPressed() async {
     const gpxType = XTypeGroup(label: 'GPX', extensions: ['gpx']);
     final file = await openFile(acceptedTypeGroups: const [gpxType]);
@@ -439,56 +437,32 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     final host = _session.lastHost;
     if (host == null || host.isEmpty) return;
 
-    // Sent over _catalogService's already-open, long-lived connection —
-    // no new connect()/sync/close() cycle needed. See
-    // RouteCatalogService's own top doc comment for why a fresh
-    // post-write verification sync (an earlier version of this method
-    // did one) is deliberately NOT done: it was found live to be its own
-    // reliability risk at this catalog's size (200+ entries), reliably
-    // making the plotter reset the connection outright, or on a separate
-    // connection simply never replying within 90s. This service's local
-    // copy is instead kept in sync the same way the real app's is —
-    // updated optimistically on send, then reconciled by whatever the
-    // plotter pushes back on its own.
-    try {
-      await _catalogService.addOrUpdateRoute(chosen.name, [for (final p in chosen.points) (p.lat, p.lon)]);
-    } on Object catch (e) {
-      _showSnack('Failed to save "${chosen.name}" to the plotter: $e');
+    // **addOrUpdateRoute (catalog-persistent save) intentionally NOT
+    // called here as of 2026-08-15** — see this method's own top doc
+    // comment for why. [syncRoute] only supports routes with exactly 4
+    // points, so anything else can't be imported at all right now.
+    if (chosen.points.length != 4) {
+      _showSnack(
+        '"${chosen.name}" has ${chosen.points.length} points — GPX import currently only '
+        'supports routes with exactly 4 points (see route_sync.dart); saving to the '
+        "plotter's catalog is temporarily disabled (remote_helm_re/findings/00_STATUS.md "
+        'Updates 127-129).',
+      );
       return;
     }
-
-    if (!choice.startNavigating) {
-      _showSnack('Saved "${chosen.name}" to the plotter.');
-      return;
-    }
-
-    // A short pause before opening the second, separate connection —
-    // live testing found the plotter can become briefly unreliable
-    // (refused/timed-out connections, even a transient full network
-    // drop) when a route_sync handshake starts immediately after a
-    // route_catalog sync/write on a large catalog, even though each
-    // step works fine in isolation. This gives the plotter a moment to
-    // settle first.
-    await Future<void>.delayed(const Duration(seconds: 3));
 
     // The plotter may prompt the user to confirm activating navigation on
     // its own screen before syncRoute's handshake completes — [timeout]
     // raised well past the 6s default so that a slow tap doesn't get
     // reported as a failure while it's actually still waiting on the user.
-    _showSnack('Saved "${chosen.name}" — confirm on the plotter to start navigating.');
+    _showSnack('Sending "${chosen.name}" — confirm on the plotter to start navigating.');
     try {
       await syncRoute(host, chosen.name, chosen.points, timeout: const Duration(seconds: 30));
       _showSnack('Now navigating "${chosen.name}".');
-    } on UnimplementedError {
-      _showSnack(
-        '"${chosen.name}" has ${chosen.points.length} points — only routes with '
-        'exactly 4 points can be sent for immediate navigation right now '
-        '(see route_sync.dart); it was still saved to the plotter\'s catalog.',
-      );
     } on RouteSyncTimeoutException catch (e) {
-      _showSnack('Saved to the catalog, but the plotter did not respond to the navigate request: $e');
+      _showSnack('The plotter did not respond to the navigate request: $e');
     } on Object catch (e) {
-      _showSnack('Saved to the catalog, but failed to start navigating: $e');
+      _showSnack('Failed to start navigating: $e');
     }
   }
 
@@ -502,19 +476,23 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   }
 }
 
-/// Result of [_GpxImportDialog]: which route to import, and whether to
-/// also start active navigation on it via [syncRoute] right after saving
-/// it to the plotter's catalog via [RouteCatalogConnection.addOrUpdateRoute].
+/// Result of [_GpxImportDialog]: which route to import. Only ever used to
+/// start active navigation on it via [syncRoute] — see
+/// `_HelmHomeScreenState._onImportGpxPressed`'s doc comment for why
+/// [RouteCatalogConnection.addOrUpdateRoute] (catalog-persistent save) is
+/// not used.
 class _GpxImportChoice {
   final GpxRoute route;
-  final bool startNavigating;
-  const _GpxImportChoice({required this.route, required this.startNavigating});
+  const _GpxImportChoice({required this.route});
 }
 
 /// Lets the user pick which `<rte>` to import (if a GPX file has more than
-/// one) and whether to start navigating it immediately after saving — see
+/// one). **Navigation-only as of 2026-08-15** — see
 /// `_HelmHomeScreenState._onImportGpxPressed`'s own doc comment for why
-/// those are two separate, independently-useful steps.
+/// the previous "start navigating immediately" checkbox (an optional
+/// extra on top of always saving to the catalog) was removed: saving to
+/// the catalog is disabled, so navigating immediately is now the only
+/// thing importing does, not a checkbox.
 class _GpxImportDialog extends StatefulWidget {
   final List<GpxRoute> routes;
   const _GpxImportDialog({required this.routes});
@@ -525,7 +503,6 @@ class _GpxImportDialog extends StatefulWidget {
 
 class _GpxImportDialogState extends State<_GpxImportDialog> {
   late GpxRoute _selected = widget.routes.first;
-  bool _startNavigating = false;
 
   @override
   Widget build(BuildContext context) {
@@ -547,19 +524,17 @@ class _GpxImportDialogState extends State<_GpxImportDialog> {
             )
           else
             Text('${_selected.name} (${_selected.points.length} points)'),
-          CheckboxListTile(
-            contentPadding: EdgeInsets.zero,
-            value: _startNavigating,
-            onChanged: (v) => setState(() => _startNavigating = v ?? false),
-            title: const Text('Start navigating this route immediately'),
-            subtitle: const Text('May prompt you to confirm on the plotter itself.'),
+          const SizedBox(height: 8),
+          const Text(
+            'This starts navigating the route immediately — it does not save it to the '
+            "plotter's route list. May prompt you to confirm on the plotter itself.",
           ),
         ],
       ),
       actions: [
         TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
         FilledButton(
-          onPressed: () => Navigator.of(context).pop(_GpxImportChoice(route: _selected, startNavigating: _startNavigating)),
+          onPressed: () => Navigator.of(context).pop(_GpxImportChoice(route: _selected)),
           child: const Text('Import'),
         ),
       ],
