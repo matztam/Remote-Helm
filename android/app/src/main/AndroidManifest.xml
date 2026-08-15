@@ -15,7 +15,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
@@ -32,6 +32,31 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- Lets another app's "Share" sheet (e.g. exporting a GPX route
+                 from a chart/navigation app) list Remote Helm as a target —
+                 see _onImportGpxPressed's doc comment in helm_home_screen.dart
+                 for what happens with the file once it arrives. GPX files are
+                 shared under wildly inconsistent MIME types in practice (some
+                 apps use application/gpx+xml, many just fall back to
+                 application/octet-stream or omit a specific type), so both a
+                 dedicated GPX filter and a generic-file fallback are declared;
+                 _onImportGpxPressed's own GPX parse step rejects anything that
+                 isn't actually GPX content. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="application/gpx+xml"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="application/octet-stream"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="text/xml"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

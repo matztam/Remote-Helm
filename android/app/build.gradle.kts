@@ -6,7 +6,9 @@ plugins {
 
 android {
     namespace = "com.matztam.remote_helm"
-    compileSdk = flutter.compileSdkVersion
+    // receive_sharing_intent requires compileSdk 37, higher than Flutter's
+    // own default (flutter.compileSdkVersion) as of this Flutter version.
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

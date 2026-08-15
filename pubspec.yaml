@@ -90,6 +90,7 @@ dependencies:
   # Lets the user send an exported GPX file to another app (Android share
   # sheet / equivalent).
   share_plus: ^13.3.0
+  receive_sharing_intent: ^1.9.0
 
 dev_dependencies:
   flutter_test:

@@ -4,9 +4,11 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../helm/discovery.dart';
@@ -61,6 +63,28 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   Timer? _autoHideTimer;
   static const _autoHideDelay = Duration(seconds: 3);
 
+  // Lets another app's Android share sheet ("Share..." on a GPX file/export)
+  // list Remote Helm as a target — see _onImportGpxPressed's doc comment for
+  // the shared processing path this feeds into (identical to picking a file
+  // via the toolbar button, just a different way of obtaining the bytes).
+  // Only ever populated on Android (see AndroidManifest.xml's intent-filters
+  // — no iOS Share Extension is wired up), but the package itself is
+  // cross-platform and a no-op stream on platforms with no incoming intent.
+  StreamSubscription<List<SharedMediaFile>>? _sharingIntentSub;
+
+  // **Added 2026-08-15** to fix a live-reproduced cold-start-via-share bug:
+  // a GPX shared while Remote Helm wasn't running yet cold-starts the app,
+  // and _handleSharedFiles (triggered by getInitialMedia(), see
+  // _initSharingIntent's doc comment) can reach _importGpxFrom's
+  // `_session.lastHost` read before _init's `await _session.loadLastHost()`
+  // below has actually completed — [HelmSessionController.lastHost] reads
+  // as null until then, so the import silently gave up with no host to
+  // send to (confirmed live via debug logging: "host=null isConnected=false").
+  // [_importGpxFrom] awaits this completer before touching [_session] at
+  // all, so it's blocked on the *real* signal (loadLastHost done) rather
+  // than a guessed delay.
+  final _initDone = Completer<void>();
+
   @override
   void initState() {
     super.initState();
@@ -72,7 +96,44 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     // this screen's lifetime, not globally, so it releases automatically
     // if the app is ever backgrounded or closed.
     WakelockPlus.enable();
+    _initSharingIntent();
     _init();
+  }
+
+  /// Wires up both halves of `receive_sharing_intent`'s API: a live stream
+  /// for files shared while the app is already running, and a one-shot
+  /// check for a file shared while the app was closed/backgrounded (the
+  /// share sheet cold-starts or resumes it). Android-only in practice (see
+  /// [_sharingIntentSub]'s doc comment).
+  void _initSharingIntent() {
+    _sharingIntentSub = ReceiveSharingIntent.instance.getMediaStream().listen(
+      _handleSharedFiles,
+      onError: (Object e) {
+        // ignore: avoid_print
+        print('HelmHomeScreen: sharing intent stream error: $e');
+      },
+    );
+    ReceiveSharingIntent.instance.getInitialMedia().then((files) {
+      // Tell the plugin we're done with the cold-start intent regardless of
+      // whether it contained anything usable, so a later hot-restart of
+      // this screen doesn't see the same stale share again.
+      ReceiveSharingIntent.instance.reset();
+      _handleSharedFiles(files);
+    });
+  }
+
+  /// Picks the first shared file that looks like it could be a GPX route
+  /// (by path extension — MIME type on the wire is unreliable, see
+  /// AndroidManifest.xml's intent-filter doc comment) and runs it through
+  /// the same import flow as the toolbar's "Import GPX" button
+  /// ([_importGpxFrom]).
+  void _handleSharedFiles(List<SharedMediaFile> files) {
+    if (files.isEmpty || !mounted) return;
+    final gpxFile = files.firstWhere(
+      (f) => f.path.toLowerCase().endsWith('.gpx'),
+      orElse: () => files.first,
+    );
+    unawaited(_importGpxFrom(File(gpxFile.path).readAsString()));
   }
 
   /// Forces a full reconnect (touch session + video) when the app returns
@@ -151,6 +212,11 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
 
   Future<void> _init() async {
     await _session.loadLastHost();
+    // Completed here, right after [lastHost] becomes readable, not after
+    // the rest of this method's connection attempt below — see
+    // [_initDone]'s doc comment for why only this part matters to callers
+    // waiting on it (e.g. [_importGpxFrom]'s cold-start-via-share case).
+    if (!_initDone.isCompleted) _initDone.complete();
     final last = _session.lastHost;
     if (last != null && last.isNotEmpty) {
       _hostController.text = last;
@@ -201,6 +267,7 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     _session.dispose();
     _catalogService.dispose();
     _hostController.dispose();
+    _sharingIntentSub?.cancel();
     super.dispose();
   }
 
@@ -225,11 +292,25 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
-        // Android is meant to run edge-to-edge/immersive; SafeArea only
-        // meaningfully insets on desktop where it's a no-op anyway alongside
-        // the normal window chrome.
-        top: isDesktopPlatform,
+        // **Top inset fixed 2026-08-15** — live report: with the control
+        // bar revealed on Android (e.g. `revealAndroidSystemUiTemporarily`
+        // bringing the system status bar back to tap Connect), the bar's
+        // buttons sat directly under the status bar (clock etc.), not
+        // reachable. `top: isDesktopPlatform` unconditionally skipped the
+        // inset on Android on the theory that the app always runs
+        // edge-to-edge there — true when the control bar is hidden
+        // (immersive video), but wrong the moment it's shown alongside a
+        // revealed status bar. Desktop's own window chrome makes this a
+        // no-op there either way, so always insetting is safe. Left/right
+        // stay unconditionally false — this is a top-vs-bottom fix, not a
+        // "wrap everything" one, and an accidental horizontal inset here
+        // was live-reproduced pushing the control bar into an overflow on
+        // narrower/portrait screens (see git history for the broken
+        // version this replaced).
+        top: isDesktopPlatform || _controlsVisible,
         bottom: isDesktopPlatform,
+        left: false,
+        right: false,
         child: Column(
           children: [
             if (_controlsVisible) _buildControlBar(context),
@@ -286,8 +367,15 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Row(
           children: [
-            SizedBox(
-              width: 160,
+            // **Fixed-width `SizedBox(width: 160)` replaced with a flexible
+            // one 2026-08-15** — live-reproduced overflowing this row on a
+            // narrower/portrait screen (a fixed 160dp text field left too
+            // little room for the buttons that follow). `flex: 2` against
+            // the trailing status text's `flex: 1` keeps the host field
+            // comfortably larger while still letting both shrink together
+            // instead of one pushing the other off-screen.
+            Flexible(
+              flex: 2,
               child: TextField(
                 controller: _hostController,
                 decoration: const InputDecoration(
@@ -388,10 +476,14 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     await _connectBoth(host);
   }
 
-  /// Picks a `.gpx` file, extracts its routes ([parseGpxRoutes]), and lets
-  /// the user choose which one to import (if there's more than one
-  /// `<rte>`, mirroring the plotter-selection flow in [_onDiscoverPressed])
-  /// and whether to also start active navigation on it immediately.
+  /// Picks a `.gpx` file via the system file picker and hands it to
+  /// [_importGpxFrom]. This is one of two entry points into the same import
+  /// flow — the other is [_handleSharedFiles], triggered when another app's
+  /// Android "Share..." sheet sends a GPX file straight to Remote Helm
+  /// (see AndroidManifest.xml's intent-filters). Both end up parsing the
+  /// file ([parseGpxRoutes]), letting the user choose which route to import
+  /// (if there's more than one `<rte>`, mirroring the plotter-selection
+  /// flow in [_onDiscoverPressed]), and syncing it.
   ///
   /// **Only uses [syncRoute] (`route_sync.dart`) — does NOT durably save to
   /// the plotter's route catalog.** [RouteCatalogConnection.addOrUpdateRoute]
@@ -405,19 +497,43 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
   /// catalog, and has never been implicated in that bug — it's the only
   /// safe way to get a GPX route onto the plotter right now. This means a
   /// GPX import is temporarily navigation-only: it won't appear later in
-  /// Browse/Delete, and [syncRoute] only supports routes with exactly 4
-  /// points (see route_sync.dart's top doc comment) — anything else can't
-  /// be imported at all until [addOrUpdateRoute] is fixed.
+  /// Browse/Delete. [syncRoute] itself has no hard point-count limit, but
+  /// only a 4-point route is verified byte-for-byte against a real capture
+  /// — see [_importGpxFrom]'s doc comment for the caveats on anything else.
+  ///
+  /// **Known side effect, accepted for now (confirmed live 2026-08-15):**
+  /// [syncRoute]'s wire format itself encodes one waypoint-shaped record per
+  /// route point (see route_sync.dart's own top doc comment on the
+  /// "waypoint" record layout) — same as the real app's own catalog-save
+  /// path, which is exactly the clutter [addOrUpdateRoute] was written to
+  /// avoid (see its doc comment, Update 11 in 00_STATUS.md). Since
+  /// [addOrUpdateRoute] is currently disabled for the crash bug above,
+  /// there's no way to import a GPX route right now without also getting
+  /// this: each imported route durably leaves one waypoint entry per point
+  /// sitting in the plotter's waypoint catalog. User-accepted tradeoff
+  /// until [addOrUpdateRoute]'s crash is root-caused and it can be turned
+  /// back on.
   Future<void> _onImportGpxPressed() async {
     const gpxType = XTypeGroup(label: 'GPX', extensions: ['gpx']);
     final file = await openFile(acceptedTypeGroups: const [gpxType]);
     if (file == null) return;
-    final gpxText = await file.readAsString();
+    await _importGpxFrom(file.readAsString());
+  }
 
+  /// Shared tail of both GPX import entry points — the toolbar's file
+  /// picker ([_onImportGpxPressed]) and an incoming Android share
+  /// ([_handleSharedFiles]) — from "here's the file's text content" through
+  /// parsing, the route-picker dialog, and [syncRoute]. [gpxText] is a
+  /// `Future` (not a plain `String`) so callers can pass a not-yet-awaited
+  /// read straight through without an extra `await`/try block of their own.
+  Future<void> _importGpxFrom(Future<String> gpxText) async {
     List<GpxRoute> routes;
     try {
-      routes = parseGpxRoutes(gpxText);
+      routes = parseGpxRoutes(await gpxText);
     } on GpxParseException catch (e) {
+      _showSnack('Could not read that GPX file: $e');
+      return;
+    } on Object catch (e) {
       _showSnack('Could not read that GPX file: $e');
       return;
     }
@@ -425,6 +541,12 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
       _showSnack('No routes found in that GPX file.');
       return;
     }
+
+    // See [_initDone]'s doc comment — this is the actual fix for the
+    // cold-start-via-share bug (host read as null). Already-completed on
+    // every non-cold-start path (toolbar button, or a share arriving while
+    // the app was already running), so this is a no-op there.
+    await _initDone.future;
 
     if (!mounted) return;
     final choice = await showDialog<_GpxImportChoice>(
@@ -434,20 +556,52 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     if (choice == null) return;
     final chosen = choice.route;
 
-    final host = _session.lastHost;
-    if (host == null || host.isEmpty) return;
-
     // **addOrUpdateRoute (catalog-persistent save) intentionally NOT
     // called here as of 2026-08-15** — see this method's own top doc
-    // comment for why. [syncRoute] only supports routes with exactly 4
-    // points, so anything else can't be imported at all right now.
-    if (chosen.points.length != 4) {
-      _showSnack(
-        '"${chosen.name}" has ${chosen.points.length} points — GPX import currently only '
-        'supports routes with exactly 4 points (see route_sync.dart); saving to the '
-        "plotter's catalog is temporarily disabled (remote_helm_re/findings/00_STATUS.md "
-        'Updates 127-129).',
-      );
+    // comment for why. [syncRoute]/[encodeRoute] have no actual point-count
+    // limit (the record format is built dynamically per point, see
+    // route_sync.dart's own doc comment) — a hard "exactly 4 points" check
+    // used to live here, but that was this method's own mistaken belief,
+    // not a real constraint in route_sync.dart; removed 2026-08-15. Only
+    // the 4-point case is verified against a real capture byte-for-byte,
+    // though; an 8-point capture also exists but its `routeMarkerByte`
+    // (route_sync.dart's [_kDefaultRouteMarkerByte] doc comment) differs
+    // from what's actually sent, and point counts beyond that are wholly
+    // untested — so this is optimistic, not proven, for anything other
+    // than 4 points.
+
+    // **Wait for a genuinely stable connection — and read [_session.lastHost]
+    // only AFTER that wait, not before — added 2026-08-15, corrected the
+    // same day.** Two things can otherwise go wrong: (a) this can run right
+    // after an Android cold start via an incoming share intent, with no
+    // saved host at all yet (first-ever connect on this install, or one
+    // freshly reinstalled) — [_session]'s [HelmSessionController.connect]
+    // only calls its own `_saveLastHost` on a SUCCESSFUL connect, so
+    // reading `lastHost` before that finishes reliably returns null even
+    // though [_init]'s [_autoDiscoverAndConnect] fallback is actively
+    // finding and connecting to a plotter in the background — confirmed
+    // live via debug logging (`host=null isConnected=false` immediately
+    // after `_initDone` completes, because `_initDone` only waits for
+    // `loadLastHost`, not for discovery+connect to finish). Reading `host`
+    // only after [_waitForStableConnection] returns true fixes this: by
+    // then, whichever path connected (saved host or discovery) has already
+    // called `_saveLastHost`. (b) even once connected, live testing
+    // elsewhere in this app found the plotter can be briefly unreliable
+    // (refused/timed-out connections, even a transient full network drop)
+    // when a second channel's handshake starts immediately after the first
+    // settles, though each works fine in isolation once given a moment —
+    // [_waitForStableConnection]'s settle delay covers that too.
+    if (!mounted) return;
+    _showSnack('Waiting for a stable connection…');
+    final stable = await _waitForStableConnection();
+    if (!stable) {
+      _showSnack('Could not reach the plotter — GPX import cancelled.');
+      return;
+    }
+
+    final host = _session.lastHost;
+    if (host == null || host.isEmpty) {
+      _showSnack('Could not determine the plotter address — GPX import cancelled.');
       return;
     }
 
@@ -464,6 +618,30 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     } on Object catch (e) {
       _showSnack('Failed to start navigating: $e');
     }
+  }
+
+  /// Blocks until [_session] reports a real, connected state, then waits a
+  /// further settle period before returning — see the call site's doc
+  /// comment (in [_importGpxFrom]) for why both halves matter. Returns
+  /// `false` (without throwing) if the connection doesn't come up within
+  /// [maxWait], so the caller can show one clear message instead of
+  /// [syncRoute] failing later with a less obvious timeout.
+  Future<bool> _waitForStableConnection({
+    // Generous enough to cover a cold start with no saved host at all —
+    // [_autoDiscoverAndConnect]'s own mDNS browse already budgets 5s, plus
+    // however long the subsequent connect handshake takes, so 20s cut it
+    // close in exactly the case this method exists for.
+    Duration maxWait = const Duration(seconds: 30),
+    Duration settleDelay = const Duration(seconds: 3),
+  }) async {
+    final deadline = DateTime.now().add(maxWait);
+    while (!_session.isConnected) {
+      if (DateTime.now().isAfter(deadline)) return false;
+      if (!mounted) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    await Future<void>.delayed(settleDelay);
+    return mounted && _session.isConnected;
   }
 
   Future<void> _onBrowseCatalogPressed() async {
