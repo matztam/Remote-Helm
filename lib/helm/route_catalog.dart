@@ -2758,26 +2758,32 @@ class RouteCatalogConnection {
     return targetUuid;
   }
 
-  /// **⚠️ KNOWN UNSAFE — DO NOT CALL from UI code as of 2026-08-15.** Every
-  /// route this method (or [debugAddOrUpdateRouteWithRefs]) has ever
-  /// created reliably crashes the plotter the moment a human opens that
-  /// route on the plotter's OWN touch-screen editor — confirmed live,
+  /// **Editor-crash bug fixed 2026-08-16, live-confirmed.** Every route
+  /// this method (or [debugAddOrUpdateRouteWithRefs]) ever created before
+  /// this fix reliably crashed the plotter the moment a human opened that
+  /// route on the plotter's own touch-screen editor — confirmed live,
   /// repeatedly, across five independent routes with different shapes
   /// (bare `{lat,lon}` points, real `ref`-linked points, simple/round
   /// coordinates, short names) — see remote_helm_re/findings/00_STATUS.md
-  /// Updates 127-129 for the full, exhaustive fault-isolation log. The
-  /// write/upload itself is NOT the problem (confirmed safe, byte-verified
-  /// against real captures) — the crash is specifically in the plotter's
-  /// editor when it later tries to open a route this method created. Root
-  /// cause NOT yet found: `ref` presence/absence, coordinate precision,
-  /// coordinate sign, and route/point name length have all been tested and
-  /// individually ruled out. A plotter-NATIVE route (created directly on
-  /// the device, not via this method) opens in the editor with no problem,
-  /// so the fault is specific to something this method's wire encoding
-  /// does differently — not yet identified. Until this is root-caused, use
-  /// [RouteCatalogConnection]/`route_sync.dart`'s `syncRoute` (navigation-
-  /// only, does not durably save to the catalog, never implicated in this
-  /// bug) for anything reachable from the UI.
+  /// Updates 127-129 for the full fault-isolation log that ruled all of
+  /// those out one at a time. The write/upload itself was never the
+  /// problem (confirmed safe, byte-verified against real captures) — the
+  /// crash was specifically in the plotter's editor when it later tried to
+  /// open a route this method created. A plotter-NATIVE route (created
+  /// directly on the device) always opened fine, so the fault was
+  /// something this method's own encoding did differently.
+  ///
+  /// **Root cause (00_STATUS.md Update 131), fix confirmed live 2026-08-16
+  /// (Update 133):** every object payload observed on the wire from the
+  /// real app or the plotter itself decompresses to JSON text followed by
+  /// one trailing `0x00` byte; this method's own gzip blob was missing it
+  /// (a JSON decoder silently ignores a trailing NUL, which is why
+  /// comparing parsed JSON never caught this — only comparing the raw
+  /// decompressed bytes did). The fix (see [_buildObjectFieldTable])
+  /// appends that byte before gzip-encoding, matching every other sender
+  /// observed on the wire — a route created this way was reproduced live
+  /// (the exact original "create waypoint, delete it, import a route"
+  /// report) and opened in the plotter's editor with no crash.
   ///
   /// Creates or updates a route on the plotter's catalog, given a list of
   /// `(lat, lon)` points — same envelope/tail mechanism as
@@ -2852,12 +2858,13 @@ class RouteCatalogConnection {
     return targetUuid;
   }
 
-  /// **⚠️ KNOWN UNSAFE — see [addOrUpdateRoute]'s doc comment, same
-  /// editor-crash bug.** Adding `ref` links (this method's whole reason to
-  /// exist) turned out NOT to fix it either — see
-  /// remote_helm_re/findings/00_STATUS.md Update 128 (crashed even with
-  /// real, correctly-linked waypoints). Kept only as a diagnostic tool for
-  /// continuing that investigation, not for any real use.
+  /// **See [addOrUpdateRoute]'s doc comment — same editor-crash bug, same
+  /// 2026-08-16 fix (both go through [_buildObjectFieldTable]).** Adding
+  /// `ref` links (this method's whole reason to exist) turned out NOT to be
+  /// the actual cause — see remote_helm_re/findings/00_STATUS.md Update 128
+  /// (crashed even with real, correctly-linked waypoints, before the fix).
+  /// Kept as a diagnostic tool; [addOrUpdateRoute] itself is the normal
+  /// entry point now that the real cause is fixed.
   ///
   /// **Temporary debug/investigation helper, added 2026-08-15** (see
   /// remote_helm_re/findings/00_STATUS.md Update 127) — a live user report
@@ -2945,7 +2952,19 @@ class RouteCatalogConnection {
   /// min_proto_ver=`19` (fieldId 3, lebLen 1), wpt_data=`27` (fieldId 4,
   /// overflow) — this message's fields are 0-indexed on the wire.
   List<int> _buildObjectFieldTable({required String uuid, required int vstamp, required Map<String, dynamic> json}) {
-    final gzipBlob = _gzipEncode(utf8.encode(jsonEncode(json)));
+    // **Trailing NUL byte added 2026-08-16** — every real object payload
+    // this session has decoded (real-app creates, and every route/waypoint
+    // the plotter itself has ever sent back across dozens of captures)
+    // decompresses to JSON text followed by one `0x00` byte; every
+    // object this client built was missing it. The two are otherwise
+    // byte-identical once that one byte is accounted for (confirmed by
+    // comparing a real-app route capture against this method's own output
+    // for the same structural content). A JSON decoder ignores a trailing
+    // NUL silently, which is why this was never visible from parsing the
+    // JSON alone — only comparing the raw decompressed bytes exposed it.
+    // Appending it here (not just for routes) keeps every object this
+    // method builds byte-shaped like what's actually observed on the wire.
+    final gzipBlob = _gzipEncode(<int>[...utf8.encode(jsonEncode(json)), 0x00]);
     final vstampBytes = _buildAddOrUpdateVstampField(vstamp);
     final uuidBytes = _parseUuid(uuid);
     const presentFieldCount = 5;

@@ -229,12 +229,9 @@ class RouteCatalogService extends ChangeNotifier {
     return resultUuid;
   }
 
-  /// **⚠️ KNOWN UNSAFE — no call sites left in the UI as of 2026-08-15, do
-  /// not wire this back up without reading
-  /// [RouteCatalogConnection.addOrUpdateRoute]'s doc comment first.** Every
-  /// route created this way reliably crashes the plotter's own editor when
-  /// later opened there — see remote_helm_re/findings/00_STATUS.md Updates
-  /// 127-129.
+  /// **See [RouteCatalogConnection.addOrUpdateRoute]'s doc comment** for
+  /// the editor-crash bug this used to have and the 2026-08-16 fix, since
+  /// live-confirmed.
   ///
   /// Creates/updates a route — see [addOrUpdateWaypoint]'s doc comment for
   /// why the local copy is updated optimistically rather than by waiting
