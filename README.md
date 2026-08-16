@@ -54,8 +54,10 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   timing out mid-use at the helm would defeat the point.
 - **GPX route import**: pushes a route straight from a `.gpx` file to the
   plotter over its own sync channel — no SD card, no cloud round-trip.
-  Supports routes of any point count (see `lib/helm/route_sync.dart`'s doc
-  comment for the one remaining known gap).
+  Supports routes of any point count. Always saved durably to the
+  plotter's catalog first; an optional checkbox also starts active
+  navigation on it immediately, matching how the real app's own points
+  show up on the plotter (see `lib/helm/route_sync.dart`'s doc comment).
 - **Browse, download & delete plotter routes, waypoints & tracks**: lists
   every route, waypoint, and saved track stored on the plotter, and for
   each one lets you download it as a `.gpx` file (to save locally or share
@@ -65,13 +67,15 @@ one codebase) and a touch-first UI meant to run full-screen on a tablet.
   end-to-end.
 - **Creating/updating routes and waypoints directly on the plotter**
   (`lib/helm/route_catalog.dart`'s `addOrUpdateWaypoint`/
-  `addOrUpdateRoute`): confirmed working live, and wired into the GPX
-  import flow — importing a `.gpx` route saves it durably to the
-  plotter's own catalog (not just an ephemeral active-navigation push),
-  without the extra per-point waypoint clutter the official app itself
-  creates for routes. An optional checkbox in the import dialog also
-  starts active navigation on it immediately, same as the original
-  import mechanism always did. See `RouteCatalogService`
+  `addOrUpdateRoute`): confirmed working live, including opening a
+  route/waypoint created this way in the plotter's own touch-screen
+  editor afterward — and wired into the GPX import flow, so importing a
+  `.gpx` route saves it durably to the plotter's own catalog (not just
+  an ephemeral active-navigation push), without the extra per-point
+  waypoint clutter the official app itself creates for routes. An
+  optional checkbox in the import dialog also starts active navigation
+  on it immediately, same as the original import mechanism always did.
+  See `RouteCatalogService`
   (`lib/ui/route_catalog_service.dart`) for how the app stays in sync
   with the plotter's catalog after that: one sync when it connects, then
   living entirely off the plotter's own unprompted push notifications
@@ -175,9 +179,8 @@ dart run bin/helm_cli.dart helm --host <plotter-ip> --tap 0.5 0.5
   was reverse-engineered from a packet capture of the real ActiveCaptain
   app doing a route sync, since neither `helm-linux`'s own protocol notes
   nor any other source covers it. See `lib/helm/route_sync.dart`'s doc
-  comment for the full wire format, including the checksum trailer, and
-  its one remaining known gap. GPX parsing itself is in
-  `lib/helm/gpx.dart`.
+  comment for the full wire format, including the checksum trailer. GPX
+  parsing itself is in `lib/helm/gpx.dart`.
 - **Route/waypoint catalog, download & delete**: a third, entirely
   different channel (port 50615) from either of the above, with its own
   outer framing (`MSG*` + length, not `0xBEEF`) and its own inner message
@@ -187,7 +190,7 @@ dart run bin/helm_cli.dart helm --host <plotter-ip> --tap 0.5 0.5
   this project; reverse-engineered the same way, from packet captures of
   the real app syncing a plotter-created route down into ActiveCaptain.
   See `lib/helm/route_catalog.dart`'s doc comment for the full wire
-  format and known gaps.
+  format.
 
 See [PROTOCOL.md](PROTOCOL.md) for the complete wire-format reference
 across all of these channels.
