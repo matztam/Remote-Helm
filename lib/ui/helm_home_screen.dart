@@ -570,7 +570,11 @@ class _HelmHomeScreenState extends State<HelmHomeScreen> with WidgetsBindingObse
     // settles, though each works fine in isolation once given a moment —
     // [_waitForStableConnection]'s settle delay covers that too.
     if (!mounted) return;
-    _showSnack('Waiting for a stable connection…');
+    // Only shown when there's actually something to wait for — if
+    // [_session] is already connected, [_waitForStableConnection] still
+    // runs its short settle delay below, but there's no point telling the
+    // user we're "waiting for a connection" when one already exists.
+    if (!_session.isConnected) _showSnack('Waiting for a stable connection…');
     final stable = await _waitForStableConnection();
     if (!stable) {
       _showSnack('Could not reach the plotter — GPX import cancelled.');

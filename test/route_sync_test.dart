@@ -144,13 +144,19 @@ const _capturedTSyncData8pt =
     '000000000000000000000000000000000000000000000000000000000000000000ffffffff000000'
     '00000000000001000a000000a7cee384';
 
-// The per-waypoint UUIDs captured alongside the 8-point payload above — all
-// zero in this capture (this import went through a different app codepath
-// than the 4-point one, which had real random UUIDs and per-point names).
-final _capturedWaypointUuids8pt = List<Uint8List>.generate(8, (_) => Uint8List(16));
+// The 8-point payload above has all-zero per-waypoint UUIDs and empty
+// names — this capture is a plain GPX import (marker byte 0x03), the shape
+// encodeRoute now defaults to, so no explicit uuidGenerator override is
+// needed to reproduce it (see the test below).
 
 void main() {
-  test('encodeRoute matches a real captured tSyncData payload byte-for-byte', () {
+  test('encodeRoute matches a real captured tSyncData payload byte-for-byte (waypoint-reference points)', () {
+    // This capture's points reference real, pre-existing, named catalog
+    // waypoints (marker byte 0x00) — a shape encodeRoute no longer
+    // defaults to (see route_sync.dart's _kPlainPositionMarkerByte doc
+    // comment), but the underlying encoder still supports via an explicit
+    // routeMarkerByte, so this stays a useful byte-for-byte regression
+    // check of that path against real capture data.
     final points = [
       const RoutePoint(name: 'Sandbjerg Vig - Mindertiefen', lat: 55.719726, lon: 10.041321),
       const RoutePoint(name: 'Bjørnsknude Flak', lat: 55.715648, lon: 10.064805),
@@ -162,6 +168,7 @@ void main() {
     final encoded = encodeRoute(
       'AAAAAAAAA',
       points,
+      routeMarkerByte: 0x00,
       uuidGenerator: () => _capturedWaypointUuids[uuidIndex++],
       // Garmin/GPS epoch seconds 1154858522 -> see route_sync.dart's
       // _waypointMetadataBlockPrefix doc comment.
@@ -172,7 +179,11 @@ void main() {
     expect(encoded.map((b) => b.toRadixString(16).padLeft(2, '0')).join(), _capturedTSyncData);
   });
 
-  test('encodeRoute matches a real captured 8-point tSyncData payload byte-for-byte', () {
+  test('encodeRoute matches a real captured 8-point tSyncData payload byte-for-byte (plain-position points)', () {
+    // This capture is a real GPX import — every point is a plain position
+    // with no catalog identity (marker byte 0x03, zero UUID, empty name),
+    // which is what encodeRoute now defaults to. No more per-byte
+    // exceptions needed: this should now match completely.
     final points = [
       const RoutePoint(name: '', lat: 55.72222240269184, lon: 10.035462314262986),
       const RoutePoint(name: '', lat: 55.72726587764919, lon: 10.066465130075812),
@@ -184,49 +195,16 @@ void main() {
       const RoutePoint(name: '', lat: 55.71899059228599, lon: 10.084311291575432),
     ];
 
-    var uuidIndex = 0;
     final encoded = encodeRoute(
       'ZZZZZZ',
       points,
-      uuidGenerator: () => _capturedWaypointUuids8pt[uuidIndex++],
       // Garmin/GPS epoch seconds 1155037918 -> see route_sync.dart's
       // _waypointMetadataBlockPrefix doc comment.
       syncTime: DateTime.utc(1989, 12, 31).add(const Duration(seconds: 1155037918)),
     );
 
     expect(encoded.length, _capturedTSyncData8pt.length ~/ 2);
-    // The last byte of every record's prefix (offset 24 within each
-    // record, i.e. payload offset 158 + i*283 + 24) is a known unknown:
-    // identical across all records within a route, but 0x00 in the
-    // 4-point capture vs. 0x03 in this 8-point one, with no derivable
-    // rule from just two data points (see route_sync.dart's
-    // _laterRecordPrefix doc comment). encodeRoute uses the only value
-    // actually confirmed to work (0x00), so these bytes are expected to
-    // differ here; everything else — including the header's length
-    // fields, the point-count field, the sync timestamp, and critically
-    // the trailer checksum recomputed over all of this — must still match
-    // exactly.
-    final actual = encoded.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    final expectedBytes = List<int>.generate(
-      _capturedTSyncData8pt.length ~/ 2,
-      (i) => int.parse(_capturedTSyncData8pt.substring(i * 2, i * 2 + 2), radix: 16),
-    );
-    final knownUnknownByteOffsets = {
-      for (var i = 0; i < points.length; i++) 158 + i * 283 + 24,
-      // The trailer checksum necessarily differs too, since it's computed
-      // over the route marker bytes above — verified separately below to
-      // still be internally consistent (i.e. it's *some* wrong-but-correctly
-      // -computed checksum, not a stale/unrelated one).
-      for (var i = expectedBytes.length - 4; i < expectedBytes.length; i++) i,
-    };
-    for (var i = 0; i < expectedBytes.length; i++) {
-      if (knownUnknownByteOffsets.contains(i)) continue;
-      expect(
-        actual.substring(i * 2, i * 2 + 2),
-        expectedBytes[i].toRadixString(16).padLeft(2, '0'),
-        reason: 'byte $i differs (excluding the known-unknown route marker bytes)',
-      );
-    }
+    expect(encoded.map((b) => b.toRadixString(16).padLeft(2, '0')).join(), _capturedTSyncData8pt);
   });
 
   test('encodeRoute rejects an empty route', () {

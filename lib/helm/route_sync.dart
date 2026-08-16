@@ -64,11 +64,11 @@
 /// |---|---|---|
 /// | 0x00 | 15 | route name (first record only), Latin-1, zero-padded/truncated |
 /// | 0x0f | 4  | total point count in the route, `u32` LE (first record only) |
-/// | 0x18 | 1  | **known unknown**: a route-level marker byte, identical across every record in a route but different between the two known captures (`0x00` for 4 points, `0x03` for 8) — see [_laterRecordPrefix]'s doc comment |
+/// | 0x18 | 1  | a per-point type marker: `0x03` for a plain position (no catalog identity — the two captures' point-level UUID/name fields are correspondingly zero/empty), `0x00` for a point that references an existing catalog waypoint (that capture's points all carried a real UUID and name) — see [_laterRecordPrefix]'s doc comment |
 /// | 0x19 | 4  | latitude, Garmin semicircle `int32` (`round(degrees * 2^31 / 180)`) |
 /// | 0x1d | 4  | longitude, same encoding |
-/// | 0x21 | 16 | per-waypoint UUID-shaped random bytes (differs on every waypoint; format/meaning not confirmed) |
-/// | 0x31 | 10 | waypoint name, Latin-1, zero-padded/truncated (confirmed via a captured "ø" stored as the single byte `0xf8`, not 2-byte UTF-8 — this field is *not* UTF-8, unlike a first guess) |
+/// | 0x21 | 16 | catalog-waypoint UUID this point references — only present (non-zero) on `0x00`-marker points; all-zero on `0x03`-marker (plain-position) points, confirmed in the real GPX-import capture |
+/// | 0x31 | 10 | that waypoint's name, Latin-1, zero-padded/truncated (confirmed via a captured "ø" stored as the single byte `0xf8`, not 2-byte UTF-8 — this field is *not* UTF-8, unlike a first guess) — empty on `0x03`-marker points, same as the UUID field |
 /// | 0x4f | 11 | fixed bytes, identical across every waypoint in both captures |
 /// | 0x5a | 4  | sync timestamp, `u32` LE seconds since the Garmin/GPS epoch (1989-12-31T00:00:00Z) — see [_waypointMetadataBlockPrefix]'s doc comment |
 ///
@@ -99,7 +99,6 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'protocol.dart';
@@ -147,9 +146,9 @@ const int _kWaypointNameOffset = 0x31;
 /// capture and all 8 of the 8-point one), but different between the two
 /// routes (`0x00` vs `0x03`) — plausibly some route-level flag or
 /// checksum-like value, but with only two data points to compare, no rule
-/// for it could be derived. Both prefixes take it as [routeMarkerByte],
-/// left at the only value actually confirmed to work (`0x00`) rather than
-/// guessed for other point counts.
+/// for it could be derived. Both prefixes take it as [routeMarkerByte] — see
+/// [_kPlainPositionMarkerByte]'s doc comment for which value this client
+/// actually sends and why.
 ///
 /// Non-first records: 11 zero bytes, `ffffffff`, 9 more zero bytes, then
 /// [routeMarkerByte].
@@ -174,10 +173,20 @@ Uint8List _firstRecordPrefixTail(int pointCount, int routeMarkerByte) {
   return tail;
 }
 
-/// The only value confirmed to work for [_laterRecordPrefix]'s and
-/// [_firstRecordPrefixTail]'s trailing "known unknown" byte — see their
-/// doc comments.
-const int _kDefaultRouteMarkerByte = 0x00;
+/// **Corrected 2026-08-16** — this client builds routes from plain
+/// coordinates (a GPX file's `<rtept>` points have no catalog identity),
+/// which the one real GPX-import capture available (an 8-point route)
+/// encoded with marker byte `0x03` and an all-zero UUID/empty name per
+/// point. A second real capture (4 points, all referencing pre-existing,
+/// named catalog waypoints) used marker `0x00` with a real UUID/name per
+/// point instead — a genuinely different point shape this client has no
+/// use for, since it never has a real catalog-waypoint UUID to reference.
+/// Previously this used `0x00` (the wrong shape) while also writing a
+/// random UUID and the point's GPX name into the fields real `0x03`-marker
+/// points always left empty — a combination never observed on the wire,
+/// mixing "this is a named waypoint reference" (the marker) with "this is
+/// an anonymous position" (the actual field contents).
+const int _kPlainPositionMarkerByte = 0x03;
 
 /// A 15-byte block after the waypoint name field, identical across every
 /// waypoint *within* a single capture but different between the two known
@@ -273,18 +282,16 @@ void _writeFixedString(Uint8List out, int offset, int size, String text) {
   out.setRange(offset, offset + n, bytes);
 }
 
-final Random _uuidRandom = Random();
-
-/// A 16-byte value confirmed to differ across every captured waypoint
-/// (never all-zero, never repeated) — almost certainly a per-waypoint
-/// UUID, though its exact format (if it's meant to be a standard UUID
-/// variant/version at all) wasn't verified. Random bytes are used here
-/// since the plotter is only ever going to see values this client itself
-/// generated — nothing observed suggests it needs to match any particular
-/// format, only to be present and (presumably) unique per waypoint.
-Uint8List _randomWaypointUuid() {
-  return Uint8List.fromList(List<int>.generate(_kWaypointUuidSize, (_) => _uuidRandom.nextInt(256)));
-}
+/// **Corrected 2026-08-16** — the per-point UUID/name fields at
+/// [_kWaypointUuidOffset]/[_kWaypointNameOffset] were previously always
+/// filled with a fresh random UUID and the point's GPX name, regardless of
+/// [_kPlainPositionMarkerByte]. The one real GPX-import capture available
+/// shows a plain-position point's UUID field all-zero and its name field
+/// empty — those fields only carry real content on a `0x00`-marker point
+/// that references an actual, pre-existing catalog waypoint (a shape this
+/// client never uses, since it has no such waypoint to reference). This
+/// zero-filled placeholder replaces the old random-UUID generator.
+Uint8List _zeroWaypointUuid() => Uint8List(_kWaypointUuidSize);
 
 /// Encodes one 283-byte waypoint record. [routeName] is only non-null for
 /// the first record in a route (see this file's top doc comment).
@@ -293,17 +300,17 @@ Uint8List _randomWaypointUuid() {
 /// non-first records. [syncTime] is the sync timestamp shared by every
 /// record in the route (see [_waypointMetadataBlockPrefix]'s doc comment
 /// for why this must be computed once per route, not once per record).
-/// [uuid] defaults to [_randomWaypointUuid]; overridable so tests can
-/// check the rest of a record byte-for-byte against a real capture
-/// without the per-waypoint UUID (necessarily random/unique in practice)
-/// getting in the way.
+/// [uuid] defaults to [_zeroWaypointUuid] (see its own doc comment);
+/// overridable for tests that want to check the rest of a record
+/// byte-for-byte against a real `0x00`-marker capture, which does carry a
+/// real per-waypoint UUID.
 Uint8List _encodeRecord(
   RoutePoint point, {
   String? routeName,
   required int pointCount,
   required Uint8List metadataBlock,
-  int routeMarkerByte = _kDefaultRouteMarkerByte,
-  Uint8List Function() uuid = _randomWaypointUuid,
+  int routeMarkerByte = _kPlainPositionMarkerByte,
+  Uint8List Function() uuid = _zeroWaypointUuid,
 }) {
   final out = Uint8List(_kRecordSize);
   if (routeName != null) {
@@ -318,7 +325,13 @@ Uint8List _encodeRecord(
   bd.setInt32(_kLatOffset, _toSemicircle(point.lat), Endian.little);
   bd.setInt32(_kLonOffset, _toSemicircle(point.lon), Endian.little);
   out.setRange(_kWaypointUuidOffset, _kWaypointUuidOffset + _kWaypointUuidSize, uuid());
-  _writeFixedString(out, _kWaypointNameOffset, _kWaypointNameSize, point.name);
+  // Left empty (all-zero, [_writeFixedString]'s default for an empty
+  // string) for a plain-position point, matching the real GPX-import
+  // capture — see [_zeroWaypointUuid]'s doc comment. [point.name] is still
+  // used elsewhere (e.g. this client's own UI), just not written into this
+  // wire field, which the real app reserves for an actual catalog
+  // waypoint's name.
+  _writeFixedString(out, _kWaypointNameOffset, _kWaypointNameSize, routeMarkerByte == _kPlainPositionMarkerByte ? '' : point.name);
   out.setRange(
     _kWaypointMetadataOffset,
     _kWaypointMetadataOffset + metadataBlock.length,
@@ -392,12 +405,17 @@ Uint8List _computeTrailerChecksum(Uint8List bodyBeforeTrailer) {
 /// the sync timestamp embedded in every record (see
 /// [_waypointMetadataBlockPrefix]'s doc comment); defaults to
 /// [DateTime.now] and is only meant to be overridden by tests that need a
-/// byte-for-byte match against a fixed historical capture.
+/// byte-for-byte match against a fixed historical capture. [routeMarkerByte]
+/// defaults to [_kPlainPositionMarkerByte] (see its own doc comment for
+/// why) — only meant to be overridden by tests reproducing the other real
+/// capture available (real, named waypoint references, marker `0x00`),
+/// since this client never has a real catalog-waypoint UUID to send there.
 Uint8List encodeRoute(
   String routeName,
   List<RoutePoint> points, {
-  Uint8List Function() uuidGenerator = _randomWaypointUuid,
+  Uint8List Function() uuidGenerator = _zeroWaypointUuid,
   DateTime? syncTime,
+  int routeMarkerByte = _kPlainPositionMarkerByte,
 }) {
   if (points.isEmpty) {
     throw ArgumentError.value(points, 'points', 'a route needs at least one point');
@@ -417,6 +435,7 @@ Uint8List encodeRoute(
       routeName: i == 0 ? routeName : null,
       pointCount: points.length,
       metadataBlock: metadataBlock,
+      routeMarkerByte: routeMarkerByte,
       uuid: uuidGenerator,
     );
     body.setRange(offset, offset + _kRecordSize, record);
