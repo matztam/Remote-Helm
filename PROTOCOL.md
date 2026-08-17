@@ -210,11 +210,11 @@ start):
 |---|---|---|
 | 0x00 | 15 | route name (first record only), Latin-1, zero-padded/truncated |
 | 0x0f | 4 | total point count in the route, `u32` LE (first record only) |
-| 0x18 | 1 | a route-level marker byte, identical across every record in one route but different between the two known real captures (`0x00` for a 4-point route, `0x03` for an 8-point one) — meaning not derived from just two data points; this implementation always emits `0x00`, the only value confirmed to work live |
+| 0x18 | 1 | a per-point type marker: `0x03` for a **plain position** (an ordinary route point with no catalog identity of its own — UUID field all-zero, name field empty) or `0x00` for a **waypoint reference** (this point stands for an actual, pre-existing, named catalog waypoint — UUID and name fields both real). Two real captures pin this down unambiguously: an 8-point GPX-imported route used `0x03` throughout with an all-zero UUID/empty name on every record, while a separate 4-point route used `0x00` throughout with a distinct real UUID and real name on every record. This implementation always emits `0x03` for GPX-imported points, since they never reference a pre-existing catalog waypoint — matching the real capture of the same operation byte-for-byte. Emitting `0x00` with a random UUID/the point's own name (an earlier, incorrect approach) made the plotter treat each point as a real waypoint reference, silently leaving one spurious catalog waypoint entry behind per route point. |
 | 0x19 | 4 | latitude, Garmin semicircle `int32` (`round(degrees * 2^31 / 180)`) |
 | 0x1d | 4 | longitude, same encoding |
-| 0x21 | 16 | a per-waypoint value that looks UUID-shaped (differs on every waypoint, never zero, never repeated) — exact format not independently confirmed |
-| 0x31 | 10 | waypoint name, Latin-1 (confirmed via a captured "ø" stored as the single byte `0xf8`, not 2-byte UTF-8 — this field is genuinely single-byte-per-character, not UTF-8 truncated mid-sequence) |
+| 0x21 | 16 | the referenced waypoint's UUID for a `0x00`-marker record, all-zero for a `0x03`-marker record (see offset 0x18 above) |
+| 0x31 | 10 | the referenced waypoint's name for a `0x00`-marker record, empty for a `0x03`-marker record, Latin-1 (confirmed via a captured "ø" stored as the single byte `0xf8`, not 2-byte UTF-8 — this field is genuinely single-byte-per-character, not UTF-8 truncated mid-sequence) |
 | 0x4f | 11 | fixed bytes, identical across every waypoint in every capture seen so far — plausibly a symbol/display-option field, not decoded further |
 | 0x5a | 4 | sync timestamp, `u32` LE seconds since the Garmin/GPS epoch (1989-12-31T00:00:00Z) |
 
@@ -349,6 +349,84 @@ request that includes one of the "extra" records simply gets no reply
 at all. `realCount` is confirmed to match what a user can count on the
 plotter's own screen.
 
+### Differential catalog sync (non-empty `tCatalogSync`)
+
+The N=0 request documented above ("I know nothing yet") is only one of
+two shapes a real `tCatalogSync` request takes. The other, non-empty
+shape is sent whenever a client already holds prior state for a topic
+from an earlier connection — e.g. a UI that cached the last-known
+catalog contents and reconnects later, rather than treating every
+connection as a first-ever sync.
+
+**Why a client sends this.** The N=0 path always returns the *entire*
+current catalog's worth of content on a first-ever sync, which is fine
+once but wasteful on every reconnect if nothing has changed. The
+non-empty digest tells the plotter exactly which `[uuid, vstamp]` pairs
+this client already has full objects for, so the plotter's reply can be
+limited to whatever changed since — see the delta semantics below.
+
+**Wire format of the request.** Structurally, the non-empty request
+reuses the exact same header-plus-record shape `tCatalogSyncReply`
+itself already uses for its response (the 26-byte record format
+documented above) — the request and reply are not a format distinction,
+just different populations of the same shape:
+
+```
+[LEB128 outerLen][8-byte correlationId][LEB128 innerLen]
+[0x02][countLebWidth][LEB128 count][0x09][LEB128 extraCount]
+[record] × (count + extraCount)
+    -- each record: [02 07 11 10][16-byte uuid][lengthByte][LEB128 vstamp]
+```
+
+`outerLen`/`innerLen` each count only the bytes strictly after their own
+field (not self-referential, unlike some other length fields this
+protocol uses elsewhere). `countLebWidth` is simply the byte width of
+the LEB128-encoded `count` immediately following it (`1` below 128
+entries, `2` from 128 up). `extraCount` mirrors the reply header's own
+"extra"/non-fetchable count field; a client that only lists entries it
+holds full objects for always sends `extraCount = 0` — a real shape
+also seen in practice, though the official app has been observed
+splitting its own known-entry list across both counts in ways not yet
+understood. Each record's vstamp length byte follows the same
+`actualLebLength(vstamp) + 8` convention already documented for
+`del_vstamp`.
+
+Unlike the N=0 request (whose outer message wrapper carries a separate,
+fixed 1-byte length field ahead of its 14-byte body), this request's
+`outerLen` is carried *inside* the body shown above rather than in a
+separate outer field — the whole `[LEB128 outerLen]...` structure above
+is what gets sent as the message body, with no extra outer length byte
+prepended. The correlation id is the same value used everywhere else on
+this topic: the topic's own `tRegisterTopic` correlation id, not a
+freshly chosen one — confirmed live for the non-empty path specifically
+(a fresh correlation id here gets no reply at all).
+
+**What the reply means.** `tCatalogSyncReply`'s body is parsed as the
+plotter's full current view of the topic in both the N=0 and the
+differential case — a real non-empty digest's reply was confirmed to
+still list every entry in the topic, not a minimal delta list. The
+*entry listing* is therefore never itself a delta. What differs between
+the two paths is the content-fetch step that follows: after an N=0
+sync, the client sends one ordinary uuid-listing batch `tGetObject` for
+everything the reply listed (see "GetObject" below). After a
+*non-empty/differential* sync, the client instead sends a single
+**version-delta `tGetObject`** — an empty-uuid-list variant of the same
+batch request, keyed only on the topic's current `remote_ver` — which
+asks the plotter for the content of whatever the preceding digest
+determined this client is missing or has stale, without needing to name
+any uuids: the plotter already knows that set from having just compared
+the digest against its own state. The reply to that request is either a
+bare echo (nothing new — the common case when the client's cached copy
+was already current) or the same concatenated-gzip-member content shape
+the uuid-batch reply uses (below).
+
+A caller merges this delta over its own previously-cached copy: for
+every uuid the sync reply still lists, a freshly-downloaded object (if
+the delta contained one) wins over the cached copy; entries the sync
+reply no longer lists at all have dropped out of the catalog — this is
+how a deletion made while the client was disconnected propagates back
+into a long-lived local cache on reconnect.
+
 ### GetObject (`tGetObject`/`tGetObjectReply`)
 
 **Single-object request:**
@@ -369,9 +447,7 @@ preceding `tCatalogSync`'s reply (found at a fixed position right after
 that reply's own echoed correlation id). Sending any other value gets
 `tGetObjectError` back.
 
-**Batch request** (`fetchObjects`, many uuids at once — confirmed to
-work unchunked up to at least several hundred uuids in one request, no
-practical batch-size limit found):
+**Batch request** (`fetchObjects`, many uuids at once):
 
 ```
 rest = leb128(len(A)) ++ A
@@ -381,6 +457,78 @@ B    = 01 01 ++ leb128(uuids.length) ++ uuids.length × (01 07 11 10 ++ uuid(16)
 
 The reply bundles one gzip+JSON blob per requested uuid, concatenated
 with no separator between members.
+
+### Batch-download size limits and chunking
+
+An earlier version of this document claimed the batch request above
+works unchunked "up to at least several hundred uuids in one request,
+no practical batch-size limit found." That claim was based on
+request-format verification only (byte-for-byte reproduction of real
+captured requests), not on a live batch download at real catalog scale
+across every object type. Later live testing at larger, real catalog
+sizes found a genuine limit — just not one that's simply a function of
+uuid count.
+
+**What actually happens at scale.** A single very large batch
+`tGetObject` — many uuids requested in one message — can make the
+plotter reset the connection outright (TCP RST) **before any reply is
+sent at all**, rather than returning a `tGetObjectError` or a partial
+result. Two independent live findings illustrate this:
+
+- A batch request for all 177 real waypoint uuids in a catalog, in one
+  message, got no reply within a generous timeout — and that single
+  timed-out request then made the plotter stop replying to *any*
+  request on *any subsequently opened connection* for an extended
+  period afterward (the same family of protective lockout behavior
+  documented in "A note on plotter reply reliability" below). A
+  same-topic batch of 118 waypoint uuids, by contrast, was confirmed
+  live to succeed cleanly and quickly.
+- Separately, a single unchunked batch request for all 64 routes in a
+  real route catalog was live-confirmed, reproducibly and in isolation,
+  to reset the connection outright — at a uuid count more than two
+  orders of magnitude smaller than the waypoint case above.
+
+**Uuid count alone doesn't explain both results — reply size does.** A
+route object's JSON carries a full embedded points array, making a
+single route's decompressed content dramatically larger than a
+single-point waypoint's; 64 routes' worth of reply content can
+therefore comfortably exceed 177 waypoints' worth. The working theory
+this project currently holds is that the real limiting factor is the
+**total size of the reply the plotter would have to assemble and
+send back**, not the number of uuids in the request — the request
+itself is accepted and parsed either way (no format-level rejection is
+ever seen), but the plotter appears to give up and reset the connection
+while still preparing or sending a reply that's grown too large, rather
+than while parsing the incoming request.
+
+**A chunked workaround exists but is not what this client uses by
+default.** Splitting uuids into small groups and requesting them via
+several separate, sequential batch requests (all reusing the same topic
+`remote_ver`) avoids the single-oversized-reply case. But comparing
+every capture on file of this client crashing a real plotter against
+every capture of the official app *not* crashing it isolated one
+behavioral difference present in every crash capture and absent from
+every clean one: a *burst* of several chunked batch requests in
+sequence, after which the plotter reset the connection at a consistent
+~8.5–9 second delay after the burst ended — even in sessions that made
+no writes at all, just a connect-time download. That fixed, delayed
+reset looks like a server-side merge/replication watchdog expiring on
+an exchange that never reached the state the plotter's own merge logic
+expected, rather than a rejection of any individual chunk.
+
+The official app, in every clean real capture examined, never sends
+more than **one** content request per topic per sync: on a first-ever
+sync, exactly one unchunked uuid-listing batch for every entry the
+digest returned (confirmed at real catalog sizes — 128 waypoints, 63
+routes — downloaded in a single request/reply pair per topic, no
+chunking, no reset); on a reconnect with prior cached state (see
+"Differential catalog sync" below), exactly one version-delta request
+(empty uuid list) instead of a uuid batch of any size. This client now
+follows the same one-request-per-topic shape rather than chunking,
+matching the real app's own behavior instead of working around the
+size limit — chunking remains available as a manual diagnostic tool
+but is understood to itself be a likely contributor to the crash
+pattern above, not just a workaround for the single-large-batch reset.
 
 **Decompressed object JSON:**
 
@@ -393,6 +541,123 @@ with no separator between members.
 `lon`/`lat` use the same Garmin semicircle encoding as the route-sync
 channel; tracks use `"id"` instead of `"name"` and carry extra `dpth`/
 `temp`/`start` fields per point.
+
+**Critical detail — a trailing NUL byte after the JSON, before gzip:**
+every real object payload decompresses to the JSON text above followed
+by exactly one `0x00` byte — confirmed across every real route/waypoint
+capture available, with no exception. A JSON decoder silently ignores
+this trailing byte, which is why it went unnoticed for a long time: it
+only became visible by comparing the *raw decompressed bytes* of a real
+capture against this project's own generated payload, not by comparing
+parsed JSON. Omitting it (an earlier bug in this project) produced
+objects that looked structurally identical after parsing but made the
+plotter's own touch-screen editor crash when opening any object built
+that way — strongly suggesting the plotter reads the stored blob as a
+null-terminated string rather than using the gzip/JSON length to bound
+the read. Always append this byte before compressing when building a
+`wpt_data` payload for a create/update (see "Creating/updating a
+catalog entry" below).
+
+### Creating/updating a catalog entry (`addOrUpdateWaypoint`/`addOrUpdateRoute`)
+
+Creating a new waypoint or route, or updating an existing one, uses the
+**same `tDeleteEntry` (`0x02`) message type** as deletion (see
+"Deleting a catalog entry" below), not a dedicated "create" message —
+the two operations share one wire shape, distinguished only by the
+fields present in the tail. This was not obvious going in: it took
+several failed live attempts (messages that sent cleanly, with every
+length field and self-referential offset checking out, but never
+appeared in the catalog afterward) before a strict field-by-field
+re-derivation against real capture traffic of the official app actually
+creating waypoints turned up the wire-format bug and the `remote_ver`
+bookkeeping mistake described below.
+
+The envelope differs from a plain delete in one structural way: instead
+of a bare UUID + optional `del_vstamp` field, the tail carries a full
+**field table** describing the object, terminated by a compressed JSON
+blob of the object's own content.
+
+**Field-tag scheme.** Every field in this table (and in the equivalent
+`tGetObjectReply` shape a plotter uses when it asks this client for an
+object mid-sync — see "Catalog sync" above, "two-way merge") uses the
+same tag-byte convention already documented for `del_vstamp` below:
+`tag = (fieldId << 3) | lebLen`, where `fieldId` is a 0-indexed field
+position and `lebLen` is either the field's own LEB128-encoded byte
+width (for small inline integers) or a fixed marker value `7` meaning
+"overflow — an explicit size follows separately" (used for the `uuid`
+and `wpt_data` fields, both wider than a tag byte's 3-bit width field
+can express directly). The five fields present, in order, with their
+field IDs and confirmed tags:
+
+| Field | fieldId | Tag byte | Notes |
+|---|---|---|---|
+| `uuid` | 0 | `0x07` | overflow marker, followed by an explicit overflow-length byte (`0x11`) and the true 16-byte length (`0x10`) |
+| `vstamp` | 1 | `(1<<3)\|lebLen` | the object's own vstamp, LEB128, no padding — e.g. a 5-byte encoding tags as `0x0d` |
+| `proto_ver` | 2 | `(2<<3)\|lebLen` | always length 1 in every real capture seen (value `2`), tag `0x11` |
+| `min_proto_ver` | 3 | `(3<<3)\|lebLen` | always length 1 (value `1`), tag `0x19` |
+| `wpt_data` | 4 | `0x27` | overflow marker, same shape as `uuid`; wraps the gzip blob |
+
+An earlier reading of a real capture misread `proto_ver`+`min_proto_ver`
+together as one fixed 4-byte marker (`02 19 01 27`) purely because both
+values happen to be small enough that their LEB128 encoding is one byte
+each — coincidentally matching the literal bytes even though the actual
+field boundary was wrong. Decoding a real `tGetObjectReply` field-by-field
+against this table confirmed all five fields and their tags exactly,
+including that this same table (not just the create-side tail) is what
+the plotter itself sends back, and what this client must echo when the
+plotter asks it for an object mid-sync.
+
+**The `wpt_data` field** wraps the gzip-compressed JSON blob using the
+same nested-length shape the catalog sync/get-object header already
+uses elsewhere in this protocol: an overflow-length LEB128 vint, the
+fixed 4-byte marker `02 01 00 0f`, then two more LEB128 values — the
+gzip length plus 2, followed by the exact gzip length — immediately
+before the raw gzip bytes.
+
+**`remote_ver` bookkeeping — same mechanism as delete.** Every
+create/update carries a `prevRemoteVer`/`newRemoteVer` pair using the
+identical packed-bitfield version-stamp shape documented below for
+deletes: `prevRemoteVer` is simply whatever `remote_ver` value this
+connection most recently learned for the topic (from the topic's own
+registration correlation id if nothing else has touched it yet, or from
+a real `tCatalogSync` reply otherwise), and `newRemoteVer` increments
+its `seq` by exactly 1 with a freshly-drawn random `sub`. Two real
+captures of successful creates confirm the protocol doesn't care *where*
+`prevRemoteVer` came from, only that it's current — one capture had
+just synced the topic immediately before its creates (so `prevRemoteVer`
+matched the sync reply's `remote_ver` byte-for-byte), the other hadn't
+touched the topic since registration and so used the registration
+correlation id directly, but *had* synced a different topic on the same
+connection first specifically because writes on that other topic had
+already advanced its own `remote_ver` past the registration-time value.
+A `prevRemoteVer` built from a stale cached value is accepted and sent
+successfully (all lengths and self-referential offsets still check out)
+but silently dropped by the plotter — the same "sends clean, does
+nothing" failure mode as the tail-encoding bug below.
+
+**The object's own `vstamp` on creation** is client-generated with
+`seq == 2` fixed, and a freshly random `sub` — confirmed across
+multiple independent real create captures, all decoding to `seq == 2`
+regardless of `sub`. This is unrelated to the topic-level `remote_ver`
+`seq` (which tracks in the hundreds on a real catalog) and unrelated to
+the delete path's `seq+1` increment scheme; `2` appears to be a real
+"first version" starting value, consistent with a separately-observed
+update (not a create) carrying `seq == 3`.
+
+**One tail-encoding bug**, found only by re-deriving every field of the
+tail from scratch against real create frames rather than re-checking
+fields already believed correct — it sent cleanly with no rejection and
+silently produced nothing in the catalog, which is what made it so hard
+to isolate: the byte right after the tail's own self-referential
+length-solving field (`A`'s own LEB128 encoding) was hardcoded `0x02`
+by analogy with the differently-shaped marker `tDeleteEntry` uses at a
+similar offset; every real create frame examined has `0x01` there
+instead. Confirmed via the same self-referential length identity the
+delete path already relies on holding exactly, once this marker byte is
+excluded from what the identity's own length count covers. Combined
+with getting `prevRemoteVer` right (above), this one byte was the
+entire remaining gap between a message that sends cleanly and one the
+plotter durably accepts.
 
 ### Version-stamp encoding
 
